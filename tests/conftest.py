@@ -18,6 +18,13 @@ def _isolate_local_state(monkeypatch, tmp_path):
     monkeypatch.setattr(state, 'FORWARD_DIR', tmp_path / 'state' / 'forward')
     monkeypatch.setattr(notify, 'NOTIFY_STATE', tmp_path / 'state' / 'notify.json')
     monkeypatch.setattr(daemon, 'DAEMON_STATE', tmp_path / 'state' / 'daemon.json')
+    # 本机真实的登录凭证也不能读进测试(里面的 user_id 因机器而异)
+    from larkx import config
+    from larkx.protocol import auth
+    monkeypatch.setattr(config, 'CREDENTIALS_PATH', tmp_path / 'credentials.json')
+    monkeypatch.setattr(auth, 'CREDENTIALS_PATH', tmp_path / 'credentials.json')
+    monkeypatch.setattr(auth.LarkAuth.__init__, '__defaults__', (tmp_path / 'credentials.json',))
+    monkeypatch.setitem(config._owner_cache, 'mtime', None)
 
 
 class FakeClient:

@@ -9,11 +9,16 @@ keep_unread), daemon 收到它们时跳过。
 forward/ 下登记 larkx forward 转发出去的消息(每个目标会话那份的 cid, 见 LarkClient.forward_message), daemon 收到它们时
 只入库, 不当成本人下的指令: 发送人是本人, 内容却是转来的, 以触发前缀开头时不能当成本人在叫数字人。
 """
+import hashlib
+import hmac
 import json
+import secrets
 import os
 import re
 import time
 from datetime import datetime, timedelta
+
+from loguru import logger
 
 from .config import DATA_DIR
 
@@ -27,12 +32,58 @@ RELAY_TTL = 8 * 86400
 KINDS = ('message', 'task', 'say', 'system', 'report')
 
 
+KEY_BYTES = 32
+# 读到了这一轮但不可信(签名不对、没签名、密钥坏了), 或者数字人进程里读不到这一轮时用它: 按访客处理, 只能更严不能更松
+UNTRUSTED_TURN = {'kind': 'message', 'chat_id': '', 'anchor': '', 'is_owner': False, 'ref': 'untrusted', 'locked': {},
+                  'untrusted': True}
+
+
+def _key_path():
+    return STATE_DIR / 'turn.key'
+
+
+def _new_turn_key() -> bytes:
+    """每一轮换一个新密钥(只有本人可读): 存下来的旧 turn.json(比如本人那一轮的)拷回来也验不过, 挡住重放。
+    数字人的工具调用不许读它(见 agent/hooks)。"""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    key = secrets.token_bytes(KEY_BYTES)
+    tmp = _key_path().with_suffix('.tmp')
+    tmp.unlink(missing_ok=True)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, 'wb') as f:
+        f.write(key)
+    tmp.replace(_key_path())
+    return key
+
+
+def _sign(data: dict, key: bytes) -> str:
+    body = json.dumps({k: v for k, v in data.items() if k != 'sig'}, ensure_ascii=False, sort_keys=True)
+    return hmac.new(key, body.encode('utf-8'), hashlib.sha256).hexdigest()
+
+
+def _verify(data: dict) -> bool:
+    try:
+        key = _key_path().read_bytes()
+    except OSError:
+        return False
+    if len(key) != KEY_BYTES:
+        logger.warning(f'turn.key 长度不对({len(key)} 字节), 这一轮按不可信处理; 下一轮 daemon 会重新生成')
+        return False
+    sig = data.get('sig')
+    if not isinstance(sig, str):
+        return False
+    # 两边都转成 bytes 再比: 非 ASCII 的 str 直接比会抛 TypeError
+    return hmac.compare_digest(sig.encode('utf-8', 'replace'), _sign(data, key).encode('ascii'))
+
+
 def write_turn(kind: str, chat_id: str = '', anchor: str = '', is_owner: bool = False, ref: str = '',
                locked: dict = None):
-    """locked: daemon 自己的配置里数字人不能用环境变量改的几项(见 config.LOCKED_KEYS), 数字人进程里的命令以这里为准。"""
+    """locked: daemon 自己的配置里数字人不能用环境变量改的几项(见 config.LOCKED_KEYS), 数字人进程里的命令以这里为准。
+    整个内容带签名(sig), read_turn 校验不过就当没有这一轮。"""
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     data = {'kind': kind, 'chat_id': str(chat_id or ''), 'anchor': anchor or '', 'is_owner': bool(is_owner),
             'ref': str(ref or ''), 'pid': os.getpid(), 'started_at': time.time(), 'locked': locked or {}}
+    data['sig'] = _sign(data, _new_turn_key())
     tmp = TURN_PATH.with_suffix('.tmp')
     tmp.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
     tmp.replace(TURN_PATH)
@@ -43,15 +94,28 @@ def clear_turn():
 
 
 def read_turn():
+    """当前这一轮; 没有正在处理的轮次时返回 None。文件在但不可信(被改过、没签名、密钥坏了)时返回 UNTRUSTED_TURN,
+    按访客处理。不会抛异常: 调用方(包括 Claude 的 hook)出错跳过检查就等于放行。"""
     try:
         data = json.loads(TURN_PATH.read_text(encoding='utf-8'))
-    except (FileNotFoundError, json.JSONDecodeError):
+    except FileNotFoundError:
         return None
+    except Exception:
+        return dict(UNTRUSTED_TURN)
     try:
+        if not isinstance(data, dict) or not _verify(data):
+            return dict(UNTRUSTED_TURN)
         os.kill(int(data.get('pid') or 0), 0)
-    except (OSError, ValueError):
+    except (OSError, ValueError, TypeError):
         return None  # 写入它的 daemon 已经退出
+    except Exception:
+        return dict(UNTRUSTED_TURN)
     return data
+
+
+def agent_turn():
+    """数字人进程里用的当前轮次: 读不到时也按访客处理(UNTRUSTED_TURN), 不当成"没有限制"。"""
+    return read_turn() or dict(UNTRUSTED_TURN)
 
 
 def _mark(folder, cid: str, chat_id: str):

@@ -1,6 +1,8 @@
 import argparse
 import io
 
+import pytest
+
 from larkx import cli
 from larkx.agent.hooks import check_tool_use
 
@@ -58,3 +60,20 @@ def test_agent_reply_signature_is_set_apart(tmp_path, monkeypatch, fake_client):
     monkeypatch.delenv('LARKX_ACTOR')
     assert cli.cmd_send(_send_args(['收到'])) == 0
     assert fake_client.sent[-1] == ('c1', '收到')
+
+
+@pytest.mark.parametrize('cmd', ['systemd-run --user larkx organize apply 1 --items 1', 'echo x | crontab -',
+                                 'echo "larkx prune" | at now', 'cat ~/.larkx/state/turn.key', '/usr/bin/at now',
+                                 'env -u LARKX_ACTOR systemd-run larkx prune', 'x=$(systemd-run a)'])
+def test_hooks_block_escape_and_turn_key(cmd):
+    from larkx.agent.hooks import check_tool_use
+    assert check_tool_use('Bash', {'command': cmd})
+
+
+@pytest.mark.parametrize('cmd', ['cat notes.txt', 'larkx chats', 'python3 batch_job.py', 'grep -n "at " x',
+                                 'larkx send c1 "用 crontab 定时"', 'larkx send c1 "systemd-run 是啥"',
+                                 'larkx send c1 -m "meet; at 3"',
+                                 "larkx send c1 -m - <<'EOF'\nmeet; at 3\ncrontab -e\nEOF"])
+def test_hooks_allow_normal_commands(cmd):
+    from larkx.agent.hooks import check_tool_use
+    assert check_tool_use('Bash', {'command': cmd}) is None

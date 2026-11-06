@@ -908,10 +908,8 @@ def cmd_say(args):
 
 def _owner_id() -> str:
     """本人的 user_id(读本地凭证, 不联网); 没登录时为空。"""
-    try:
-        return str(LarkAuth().user_id or '')
-    except Exception:
-        return ''
+    from .config import owner_user_id
+    return owner_user_id()
 
 
 def cmd_jobs(args):
@@ -1091,9 +1089,19 @@ def cmd_organize(args):
         return 0
     if not owner_turn:
         return _fail(args, '整理方案只有本人同意后才能执行或撤销', code=3)
-    owner_chat = str(cfg.get('notify_chat') or notify._load().get('owner_chat') or '')
-    if agent and (not owner_chat or str(turn.get('chat_id') or '') != owner_chat):
-        return _fail(args, '整理方案只能在本人私聊里执行或撤销', code=3)
+    if agent:
+        from . import groups
+        from .storage.models import Chat, ChatProfile
+        s = st.Session()
+        try:
+            cid = str(turn.get('chat_id') or '')
+            profiles = {p.chat_id: p for p in s.query(ChatProfile).filter(ChatProfile.chat_id == cid)}
+            chat = s.get(Chat, cid) if cid else None
+        finally:
+            s.close()
+        # 和清理、"不清理"标记用同一个判断: 记下的本人私聊(必须是私聊), 或者私聊对象是本人
+        if not cid or (chat and chat.chat_type not in (0, 1)) or cid not in groups.own_chats(profiles, cfg, _owner_id()):
+            return _fail(args, '整理方案只能在本人私聊里执行或撤销', code=3)
     try:
         if act == 'undo':
             res = store.undo(prop.id, organize.FeishuOps(LarkClient(LarkAuth())))
@@ -1631,17 +1639,24 @@ def main():
         args.text += extra
     elif extra:
         parser.error(f'无法识别的参数: {" ".join(extra)}')
-    if is_agent_actor():
+    # 数字人起的命令都要过访客检查: 不只看 LARKX_ACTOR(env -u 去掉它也认得出, 见 inside_twin);
+    # daemon 自己(同一个服务单元里)跑的 daemon/listen 不算
+    if is_agent_actor() or (args.cmd not in SERVICE_CMDS and inside_twin()):
         denied = _guest_denied(args)
         if denied:
             sys.exit(_fail(args, denied, code=3))
     sys.exit(args.fn(args))
 
 
+# 服务本身(systemd 单元里)启动时跑的子命令
+SERVICE_CMDS = ('daemon', 'listen', 'web')
+
+
 def _guest_denied(args) -> str:
-    """访客发起的这一轮(不是本人发起): 只能用少数子命令, 只能看当前会话; 被拦下时通知本人。"""
+    """访客发起的这一轮(不是本人发起): 只能用少数子命令, 只能看当前会话; 被拦下时通知本人。
+    读不到这一轮或这一轮不可信(turn.json 被改过、没签名)时也按访客处理, 只能更严。"""
     from . import guest
-    turn = state.read_turn()
+    turn = state.agent_turn()
     if not guest.is_guest(turn):
         return ''
     st = Storage()

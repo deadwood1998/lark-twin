@@ -54,7 +54,8 @@ def test_turn_file_ignored_when_daemon_gone(tmp_path, monkeypatch):
     state.write_turn('message', 'c1', is_owner=True, ref='m1')
     assert state.read_turn()['chat_id'] == 'c1'
     data = json.loads((tmp_path / 'turn.json').read_text())
-    data['pid'] = 2 ** 22 + 12345  # 不存在的进程
+    data['pid'] = 2 ** 22 + 12345  # 不存在的进程(当成那个 daemon 自己写的: 重新签名)
+    data['sig'] = state._sign(data, (tmp_path / 'turn.key').read_bytes())
     (tmp_path / 'turn.json').write_text(json.dumps(data))
     assert state.read_turn() is None
 

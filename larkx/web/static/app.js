@@ -220,10 +220,12 @@ function hourlyChart(data) {
 function turnCard(o) {
   const t = o.turn;
   if (!t) return h('div', { class: 'row' }, h('span', { class: 'pill' }, h('i'), '空闲'), h('span', { class: 'muted' }, o.inbox_pending ? `排队 ${o.inbox_pending} 条` : '没有排队的消息'));
+  if (t.untrusted) return h('div', { class: 'row' }, h('span', { class: 'pill warn' }, h('i'), '轮次信息不可信'),
+    h('span', { class: 'muted' }, '状态文件没有有效签名（升级后还没重启 daemon，或被改过），这一轮按访客处理；重启服务即可恢复'));
   return h('div', { class: 'row' },
     h('span', { class: 'pill warn' }, h('i'), `正在处理${KIND[t.kind] || t.kind}`),
     h('span', {}, chatLabel(t.chat_id)), h('span', { class: 'tag' + (t.is_owner ? ' owner' : '') }, t.is_owner ? '本人发起' : '访客'),
-    h('span', { class: 'muted' }, `已 ${Math.round(t.elapsed)} 秒`), h('div', { style: 'flex:1' }),
+    t.elapsed != null ? h('span', { class: 'muted' }, `已 ${Math.round(t.elapsed)} 秒`) : null, h('div', { style: 'flex:1' }),
     h('button', { class: 'btn danger', onclick: () => confirm('打断当前任务并清空排队的消息?') && act(() => api('/api/control', { method: 'POST', body: { action: 'interrupt' } }), r => r.result) }, '打断'));
 }
 

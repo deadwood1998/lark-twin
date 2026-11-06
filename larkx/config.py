@@ -196,6 +196,24 @@ def trusted_config() -> dict:
     return cfg
 
 
+_owner_cache = {'mtime': None, 'user_id': ''}
+
+
+def owner_user_id() -> str:
+    """本人的 user_id: 只读本地凭证里的这一个字段(按文件修改时间缓存), 不构造整个 LarkAuth; 没登录时为空。"""
+    try:
+        mtime = CREDENTIALS_PATH.stat().st_mtime
+    except OSError:
+        return ''
+    if _owner_cache['mtime'] != mtime:
+        try:
+            uid = str(json.loads(CREDENTIALS_PATH.read_text(encoding='utf-8')).get('user_id') or '')
+        except (OSError, ValueError, AttributeError):
+            uid = ''
+        _owner_cache.update(mtime=mtime, user_id=uid)
+    return _owner_cache['user_id']
+
+
 def is_agent_actor() -> bool:
     return os.environ.get(ACTOR_ENV) == "agent"
 

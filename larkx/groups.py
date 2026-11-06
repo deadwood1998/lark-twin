@@ -53,11 +53,8 @@ def own_chats(profiles: dict, cfg: dict = None, owner_id: str = '') -> set:
     from .config import load_config
     cfg = load_config() if cfg is None else cfg
     if not owner_id:
-        try:  # 读本地凭证, 不联网
-            from .protocol import LarkAuth
-            owner_id = str(LarkAuth().user_id or '')
-        except Exception:
-            owner_id = ''
+        from .config import owner_user_id
+        owner_id = owner_user_id()
     own = set()
     for c in (cfg.get('notify_chat'), notify._load().get('owner_chat')):  # 优先认记下的本人私聊, 但必须是私聊
         p = profiles.get(str(c)) if c else None

@@ -4,6 +4,8 @@ import json
 import sys
 import time
 
+import pytest
+
 from larkx import cli, notify, state
 from larkx.storage import Storage
 
@@ -413,3 +415,83 @@ def test_added_column_race_ignored(tmp_path, monkeypatch):
         return i
     monkeypatch.setattr('sqlalchemy.inspect', stale)
     Storage(f'sqlite:///{db}')                                                       # 不报 duplicate column
+
+
+def test_turn_is_signed():
+    """数字人直接改 turn.json(把自己改成本人、打开开关)、去掉签名: 按不可信的访客轮次处理, 不当成没有限制。"""
+    import json as _json
+    from larkx import state
+    state.write_turn('system', 'self', ref='job:organize#1', locked={'organize': False})
+    assert state.read_turn()['ref'] == 'job:organize#1'
+    assert (state.STATE_DIR / 'turn.key').stat().st_mode & 0o777 == 0o600
+    data = _json.loads(state.TURN_PATH.read_text(encoding='utf-8'))
+    data.update(kind='message', is_owner=True, locked={'organize': True})
+    state.TURN_PATH.write_text(_json.dumps(data), encoding='utf-8')
+    t = state.read_turn()
+    assert t['untrusted'] and state.is_guest(t) and not t['is_owner'] and t['locked'] == {}
+    data.pop('sig')                                                          # 升级时旧 daemon 写的: 没有签名
+    state.TURN_PATH.write_text(_json.dumps(data), encoding='utf-8')
+    assert state.is_guest(state.read_turn())
+    state.TURN_PATH.write_text('{坏的', encoding='utf-8')
+    assert state.is_guest(state.read_turn())
+
+
+def test_turn_key_problems_fail_closed():
+    import json as _json
+    from larkx import state
+    state.write_turn('message', 'self', is_owner=True, ref='m1')
+    (state.STATE_DIR / 'turn.key').write_bytes(b'')                          # 空密钥: 不能用空 key 验过
+    assert state.is_guest(state.read_turn())
+    state.write_turn('message', 'self', is_owner=True, ref='m2')            # 下一轮重新生成
+    assert len((state.STATE_DIR / 'turn.key').read_bytes()) == 32 and state.read_turn()['ref'] == 'm2'
+    data = _json.loads(state.TURN_PATH.read_text(encoding='utf-8'))
+    data['sig'] = '签名'                                                      # 非 ASCII: 不抛 TypeError
+    state.TURN_PATH.write_text(_json.dumps(data, ensure_ascii=False), encoding='utf-8')
+    assert state.is_guest(state.read_turn())
+
+
+def test_turn_replay_rejected():
+    """把本人那一轮的 turn.json 存下来, 访客那一轮再拷回去: 每一轮换了新密钥, 验不过。"""
+    from larkx import state
+    state.write_turn('message', 'self', is_owner=True, ref='owner-turn')
+    saved = state.TURN_PATH.read_text(encoding='utf-8')
+    state.write_turn('message', 'g1', is_owner=False, ref='guest-turn')
+    state.TURN_PATH.write_text(saved, encoding='utf-8')
+    assert state.read_turn()['untrusted']
+
+
+def test_agent_turn_defaults_to_guest():
+    from larkx import state
+    assert state.read_turn() is None and state.is_guest(state.agent_turn())
+
+
+def test_cli_treats_untrusted_turn_as_guest(monkeypatch, capsys):
+    """数字人去掉 LARKX_ACTOR、turn.json 读不到或被改过: 也按访客检查, 不能读别的会话。"""
+    from larkx import cli, guest
+    monkeypatch.delenv('LARKX_ACTOR', raising=False)
+    monkeypatch.setattr(cli, 'inside_twin', lambda: True)
+    seen = []
+    monkeypatch.setattr(guest, 'cli_denied', lambda cmd, args, turn, st: seen.append(turn) or '访客不能看别的会话')
+    monkeypatch.setattr('larkx.notify.Notifier.alert', lambda *a, **k: None)
+    monkeypatch.setattr(cli, 'LarkClient', lambda auth: None)
+    monkeypatch.setattr(cli, 'LarkAuth', lambda: None)
+    monkeypatch.setattr('sys.argv', ['larkx', 'messages', 'other-chat'])
+    with pytest.raises(SystemExit) as e:
+        cli.main()
+    assert e.value.code == 3 and seen and seen[0]['untrusted']
+
+
+def test_hook_fails_closed_on_error(monkeypatch):
+    from larkx import state
+    from larkx.agent import hooks
+    monkeypatch.setattr(state, 'agent_turn', lambda: (_ for _ in ()).throw(RuntimeError('boom')))
+    out = asyncio.run(hooks.make_pre_tool_use('/tmp')({'tool_name': 'Bash', 'tool_input': {'command': 'ls'}}, 'x', None))
+    assert out['hookSpecificOutput']['permissionDecision'] == 'deny'
+
+
+def test_owner_user_id_reads_only_credentials(tmp_path):
+    import json as _json
+    from larkx import config
+    assert config.owner_user_id() == ''                                      # 测试里不读本机真实凭证
+    config.CREDENTIALS_PATH.write_text(_json.dumps({'user_id': '555', 'cookies': {}}), encoding='utf-8')
+    assert config.owner_user_id() == '555'

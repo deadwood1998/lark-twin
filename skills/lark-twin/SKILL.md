@@ -104,7 +104,7 @@ uv venv && uv pip install -e .
 |---|---|
 | 看状态 | `.venv/bin/larkx service status` |
 | 看日志 | `.venv/bin/larkx service logs -n 100`（持续跟踪加 `-f`；日志文件是 `~/.larkx/logs/daemon.log`） |
-| 改了 `.env`、升级了代码 | `.venv/bin/larkx service restart`。升级后也要 `larkx skill install` 刷新本机 agent 的 skill |
+| 改了 `.env`、升级了代码 | `.venv/bin/larkx service restart`。升级时拉完代码要**立刻**重启：旧 daemon 写的轮次信息没有签名，新代码会按访客处理，数字人在重启前会处处被拦。升级后也要 `larkx skill install` 刷新本机 agent 的 skill |
 | 切换后端 | 改 `LARKX_AGENT_BACKEND` 和对应的启动命令，执行 `doctor`，再 `service restart`。两种后端各有各的会话，但长期记忆是共用的 |
 | 暂停 / 恢复 | `.venv/bin/larkx service stop` / `start` |
 | 看数字人发过什么 | `.venv/bin/larkx audit --limit 50` |

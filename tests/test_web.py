@@ -104,3 +104,18 @@ def test_ack_reaction_is_not_a_sent_message(client):
     assert [(r['actor'], r['action'], r['recalled']) for r in rows] == [('daemon', 'ack_reaction', False)] * 2
     assert [c['replies'] for c in client.get('/api/conversations', headers=auth).json()] == [[]]
     assert web._hourly(st)[-1]['sent'] == 0 and st.count_actions('agent', ('send', 'forward'), datetime(2000, 1, 1)) == 0
+
+
+def test_overview_with_untrusted_turn(client):
+    """升级窗口里旧 daemon 写的 turn.json 没有签名: 总览照常打开, 标出"不可信"。"""
+    import json as _json
+    import os
+    from larkx import state
+    state.STATE_DIR.mkdir(parents=True, exist_ok=True)
+    state.TURN_PATH.write_text(_json.dumps({'kind': 'message', 'chat_id': 'c1', 'is_owner': False, 'ref': 'm1',
+                                            'pid': os.getpid(), 'started_at': 1}), encoding='utf-8')
+    client.post('/login', json={'token': web.get_token()})
+    r = client.get('/api/overview')
+    assert r.status_code == 200
+    t = r.json()['turn']
+    assert t['untrusted'] and t['elapsed'] is None

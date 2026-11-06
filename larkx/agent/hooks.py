@@ -17,6 +17,67 @@ FORBIDDEN_CMD = re.compile(r'\b(larkx|lark)\s+(api|auth|listen|daemon|service|do
 WHITELIST_WRITE = re.compile(r'\b(larkx|lark)\s+whitelist\s+(add|remove)\b')
 # 例行任务只能由本人手动触发(看状态和记录可以)
 JOBS_RUN = re.compile(r'\b(larkx|lark)\s+jobs\s+run\b')
+# 把命令放到 daemon 服务之外去跑(跳出 cgroup, 进程祖先里也没有数字人的标记), 之后就认不出是数字人了。
+# 只看命令位置上的词(跳过引号里的内容和 heredoc 正文), 免得 larkx send ... "用 crontab 定时" 这种也被拦。
+# 这一层只防误用和提示词注入, 不是安全边界: 换个写法(python 拼路径之类)还是能绕过
+ESCAPE_PROGRAMS = {'systemd-run', 'crontab', 'at', 'batch'}
+WRAPPERS = {'sudo', 'env', 'nohup', 'command', 'exec', 'time', 'nice', 'setsid', 'timeout', 'xargs'}
+HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][\w]*)\1")
+
+
+def _strip_heredocs(command: str) -> str:
+    out, end = [], None
+    for line in command.splitlines():
+        if end is not None:
+            if line.strip() == end:
+                end = None
+            continue
+        out.append(line)
+        m = HEREDOC.search(line)
+        if m:
+            end = m.group(2)
+    return '\n'.join(out)
+
+
+def command_words(command: str):
+    """命令里每一段(;、&&、||、|、&、(、换行、`、$( 分开)的程序名; 引号里的内容不算。解析不了时返回 None。"""
+    import shlex
+    text = _strip_heredocs(command or '').replace('$(', ' ; ').replace('`', ' ; ')
+    words = []
+    for line in text.splitlines():
+        lex = shlex.shlex(line, posix=True, punctuation_chars=';&|()')
+        lex.whitespace_split = True
+        try:
+            tokens = list(lex)
+        except ValueError:
+            return None
+        start, skip_next = True, False
+        for tok in tokens:
+            if tok and set(tok) <= set(';&|()'):
+                start, skip_next = True, False
+                continue
+            if not start:
+                continue
+            if skip_next:
+                skip_next = False
+                continue
+            if '=' in tok and not tok.startswith('-'):
+                continue  # FOO=bar cmd
+            if tok in WRAPPERS or (tok.startswith('-') and words and words[-1] in WRAPPERS):
+                if tok in ('-u', '--unset'):
+                    skip_next = True
+                words.append(tok)
+                continue
+            words.append(tok)
+            start = False
+    return words
+
+
+def escape_denied(command: str) -> bool:
+    words = command_words(command)
+    if words is None:  # 引号不配对之类解析不了: 退回整段匹配, 宁可多拦
+        return bool(re.search(r'\b(systemd-run|crontab)\b|(^|[;&|(`]\s*)(at|batch)\s', command or ''))
+    return any(w.rsplit('/', 1)[-1] in ESCAPE_PROGRAMS for w in words)
 
 
 def _deny(reason: str) -> dict:
@@ -27,25 +88,32 @@ def _deny(reason: str) -> dict:
 def check_tool_use(tool_name: str, tool_input: dict):
     """返回拒绝原因; 放行时返回 None。"""
     blob = json.dumps(tool_input or {}, ensure_ascii=False)
-    if 'credentials.json' in blob or 'web_token' in blob:
-        return '数字人不能读取或修改飞书登录凭证和网页控制台令牌'
+    if 'credentials.json' in blob or 'web_token' in blob or 'turn.key' in blob:
+        return '数字人不能读取或修改飞书登录凭证、网页控制台令牌和轮次签名密钥'
     if tool_name == 'Bash' and FORBIDDEN_CMD.search((tool_input or {}).get('command', '')):
         return '数字人不能调用 larkx api / auth / listen / daemon / service / doctor / say / skill / web / prune / backfill; 需要的能力请用 larkx 的其他子命令'
     if tool_name == 'Bash' and WHITELIST_WRITE.search((tool_input or {}).get('command', '')):
         return '数字人不能修改唤起白名单, 只有本人能改; 想加进白名单的人请直接找本人'
     if tool_name == 'Bash' and JOBS_RUN.search((tool_input or {}).get('command', '')):
         return '数字人不能手动触发例行任务; larkx jobs list / log 可以看'
+    if tool_name == 'Bash' and escape_denied((tool_input or {}).get('command', '')):
+        return '数字人不能用 systemd-run、crontab、at 把命令放到服务之外去跑; 定时的事用 larkx task add'
     return None
 
 
 def make_pre_tool_use(agent_home: str, on_alert=None):
     async def _pre_tool_use(inp, tool_use_id, ctx):
         tool, ti = inp.get('tool_name'), inp.get('tool_input')
-        reason = check_tool_use(tool, ti)
-        turn = state.read_turn()
-        guest_mode = guest.is_guest(turn)
-        if not reason and guest_mode:
-            reason = guest.tool_denied(tool, ti, agent_home)
+        try:
+            # 先确定这一轮是谁发起的: 读不到或不可信时按访客处理(state.agent_turn); 检查过程中出错一律拒绝
+            turn = state.agent_turn()
+            guest_mode = guest.is_guest(turn)
+            reason = check_tool_use(tool, ti)
+            if not reason and guest_mode:
+                reason = guest.tool_denied(tool, ti, agent_home)
+        except Exception as e:
+            logger.exception('检查工具调用时出错, 按拒绝处理')
+            return _deny(f'检查这次工具调用时出错({e!r}), 已拒绝')
         if reason:
             detail = json.dumps(ti, ensure_ascii=False)[:200]
             logger.warning(f'[agent] 已拒绝 {tool}: {reason} | {detail}')
