@@ -71,6 +71,7 @@ larkx organize show              # 看最新的整理方案; organize apply 3 --
 larkx backfill --dry-run         # 回填最近的聊天历史, 先看规模(打开 LARKX_BACKFILL_DAYS 后启动时自动做一次)
 larkx memory list --type 事 --status 待跟进   # 按字段筛记忆; memory lint 检查、memory stats 统计(结构化记忆)
 larkx recall <msg_id>            # 撤回一条
+larkx urgent <msg_id> [--to 名字]  # 加急本人发的一条(默认应用内; 私聊默认对方); urgent status <msg_id> 看谁确认了
 larkx service status | logs -f   # 运行状态
 ```
 

@@ -80,6 +80,23 @@ larkx forward <msg_id> <msg_id> ... --merge --to <chat_id> --json             # 
 - 合并转发只能合并同一个会话里的消息。卡片标题由飞书按源会话生成（群名，私聊是"A与B的会话"），不能自定义。
 - 转发记录在 `larkx audit` 里。
 
+## 加急消息
+
+```bash
+larkx urgent <msg_id> --json                                   # 应用内加急（默认）；私聊默认加急对方
+larkx urgent <msg_id> --to <user_id 或名字> [--to ...] --json   # 群里必须指定加急谁
+larkx urgent <msg_id> --type sms|phone --to <user_id> --json   # 短信 / 电话加急，可能计费，要显式指定
+larkx send <chat_id> --urgent [--urgent-to <user_id>] [--urgent-type app|sms|phone] --json -   # 发出后立即加急
+larkx urgent status <msg_id> [<msg_id> ...] --json             # 每个被加急的人是否已确认（acked、confirm_time）
+```
+
+**加急前，要先和本人确认加急哪条、加急谁、用哪种方式**，除非本人已经明确给出。
+
+- 只能加急本人自己发出的消息，别人的消息会直接报错。`--to` 写名字时要能唯一对应一个人，否则报错并列出候选，改用 user_id。
+- 加急不改变已读：请求里只有本人这条消息的 id 和被加急的人，不读别人的消息，不产生已读回执。
+- 数字人只有在本人发起的一轮里能加急，而且只能用应用内加急；访客、维护任务里一律拒绝。加急记录在 `larkx audit` 里。
+- 消息撤回后，加急也随之结束（`urgent status` 里显示为已确认）。
+
 ## 看聊天记录
 
 ```bash

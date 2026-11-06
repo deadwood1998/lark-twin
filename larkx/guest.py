@@ -12,7 +12,7 @@ import shlex
 
 from . import state
 
-# 访客发起的这一轮里允许用的 larkx 子命令; 其余一律拒绝
+# 访客发起的这一轮里允许用的 larkx 子命令; 其余一律拒绝。urgent(加急)故意不在里面: 加急会把别人叫起来, 只能本人发起
 GUEST_CLI_ALLOWED = {'send', 'forward', 'recall', 'task', 'messages', 'history', 'download'}
 # 访客这一轮里完全禁止的工具: 联网、开子 agent
 GUEST_BLOCKED_TOOLS = {'WebFetch', 'WebSearch', 'Task', 'Agent'}

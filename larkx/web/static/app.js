@@ -316,7 +316,7 @@ async function viewActivity() {
       h('tbody', {}, rows.map(r => h('tr', { class: 'act' },
         h('td', { class: 'muted nowrap' }, fmt(r.time)),
         h('td', { class: 'nowrap' }, ACTOR[r.actor] || '本人', r.turn_kind ? h('div', { class: 'muted', style: 'font-size:11.5px' }, KIND[r.turn_kind] || r.turn_kind) : null),
-        h('td', { class: 'nowrap' }, { send: '发消息', forward: '转发', recall: '撤回', whitelist: '白名单', setting: '设置', deny_reply: '没权限回复', ack_reaction: '表情回复' }[r.action] || r.action),
+        h('td', { class: 'nowrap' }, { send: '发消息', forward: '转发', recall: '撤回', urgent: '加急', whitelist: '白名单', setting: '设置', deny_reply: '没权限回复', ack_reaction: '表情回复' }[r.action] || r.action),
         h('td', { style: 'min-width:120px;max-width:220px' }, h('div', { class: 'lines2', title: chatLabel(r.chat_id, r.chat_name) }, chatLabel(r.chat_id, r.chat_name))),
         h('td', { style: 'width:50%', class: r.recalled ? 'muted' : null }, clamp(r.content)),
         h('td', { class: 'nowrap' }, r.ok ? '✓' : h('span', { class: 'tag bad', title: r.error }, '✗ ' + (r.error || '').slice(0, 40))),

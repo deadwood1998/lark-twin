@@ -199,6 +199,26 @@ def cmd_send(args):
     agent = is_agent_actor()
     turn = state.read_turn() if agent else None
     client = LarkClient(LarkAuth())
+    urgent_type = getattr(args, 'urgent_type', None) or ('app' if getattr(args, 'urgent', False) or getattr(args, 'urgent_to', None) else None)
+    urgent_to = []
+    if urgent_type:
+        # 发出去之前先确认能加急、加急谁, 免得消息发了加急却被拒
+        err = _urgent_denied(turn, urgent_type) if agent else ''
+        if not err and getattr(args, 'urgent_to', None):
+            urgent_to, err = _resolve_urgent_targets(client, args.urgent_to)
+        elif not err:
+            try:
+                peer = client.p2p_peer(args.chat_id)
+            except Exception as e:
+                peer, err = '', f'查询会话失败: {e}'[:300]
+            urgent_to = [peer] if peer else []
+            err = err or ('' if peer else '群里加急要用 --urgent-to 指定加急谁(user_id 或名字, 可以写几个)')
+        if not err and str(client.auth.user_id) in urgent_to:
+            err = '不能加急本人自己'
+        if err:
+            if agent:
+                _audit(st, 'urgent', args.chat_id, f'发送并加急 → {" ".join(urgent_to) or "(默认对象)"}', ok=False, error=err)
+            return _fail(args, err + '(消息没有发出)')
     # 防自回环的前缀检测按纯文本做, 不能让 markdown 格式把开头的触发前缀藏起来
     plain = text
     if getattr(args, 'markdown', False):
@@ -254,11 +274,24 @@ def cmd_send(args):
             notifier.send(f'📤 数字人在「{name}」发了:\n{text}', fallback=False)
     # 用服务端 id 落库,监听收到回显时会补全这条而不是再插一条
     st.save_message({'msg_id': msg_id, 'chat_id': args.chat_id, 'chat_type': 0, 'scope': 'topic' if args.root else 'chat', 'anchor': args.root or '', 'from_id': client.auth.user_id, 'msg_type': 2 if getattr(args, 'markdown', False) else 4, 'msg_type_name': 'POST' if getattr(args, 'markdown', False) else 'TEXT', 'content': plain if getattr(args, 'markdown', False) else text, 'content_data': {'_larkx_mention_ids': [m['user_id'] for m in mentions]}, 'create_time': int(datetime.now().timestamp())}, sender_name='我', direction='out')
+    urgent, urgent_err = None, ''
+    if urgent_type:
+        mine = {'msg_id': msg_id, 'chat_id': args.chat_id, 'from_id': client.auth.user_id, 'recalled': False}
+        urgent, urgent_err = _do_urgent(args, client, st, cfg, msg_id, urgent_to, urgent_type, msg=mine)
     if args.json:
-        _print_json({'ok': True, 'msg_id': msg_id, 'chat_id': args.chat_id})
+        out = {'ok': not urgent_err, 'msg_id': msg_id, 'chat_id': args.chat_id}
+        if urgent_type:
+            out['urgent'] = urgent
+        if urgent_err:
+            out['error'] = f'消息已发出, 加急没成功: {urgent_err}'
+        _print_json(out)
     else:
         print(f'已发送 msg_id={msg_id}')
-    return 0
+        if urgent:
+            print(f'已{URGENT_TYPE_NAMES[urgent_type]}加急 → {" ".join(urgent["urgent"]) or "(无)"}')
+        if urgent_err:
+            print(f'消息已发出, 加急没成功: {urgent_err}', file=sys.stderr)
+    return 1 if urgent_err else 0
 
 
 def _forward_denied(st, cfg, sources: list, targets: list, turn, count: int, merge: bool) -> str:
@@ -730,6 +763,152 @@ def cmd_recall(args):
         _print_json({'ok': True, 'msg_id': args.msg_id})
     else:
         print(f'已撤回 {args.msg_id}')
+    return 0
+
+
+URGENT_TYPE_NAMES = {'app': '应用内', 'sms': '短信', 'phone': '电话'}
+
+
+def _urgent_denied(turn, urgent_type: str) -> str:
+    """数字人这次加急是否越权; 越权时返回原因。规则同跨会话发消息: 只有本人发起的一轮(本人的消息、终端 say)能加急,
+    访客、维护任务、汇报都不行; 短信、电话可能计费, 数字人一律不能用。"""
+    if urgent_type != 'app':
+        return f'数字人不能发{URGENT_TYPE_NAMES[urgent_type]}加急(可能计费), 需要本人在终端里执行'
+    if not turn:
+        return '当前没有正在处理的消息, 数字人不能加急'
+    if turn.get('kind') == 'system':
+        return '维护任务里不能加急'
+    if turn.get('kind') == 'report':
+        return '汇报里不能加急'
+    if turn.get('kind') == 'say' or (turn.get('is_owner') and not turn.get('untrusted')):
+        return ''
+    return '加急需要本人发起'
+
+
+def _resolve_urgent_targets(client, targets: list) -> tuple:
+    """--to 里的 user_id 或名字 → ([user_id], 错误)。名字要能唯一确定一个人, 否则报错并列出候选。"""
+    from . import whitelist as wl
+    out = []
+    for t in targets:
+        t = str(t).strip()
+        if t.isdigit():  # 名字不会是纯数字
+            out.append(t)
+            continue
+        people = wl.search_people(client, t)
+        exact = [p for p in people if p['name'] == t]
+        if len(exact) == 1:
+            out.append(exact[0]['user_id'])
+            continue
+        if not people:
+            return [], f'没有搜到叫「{t}」的人'
+        cands = '; '.join(wl.label(p) for p in (exact or people)[:5])
+        return [], f'「{t}」对应不到唯一的人, 请改用 user_id: {cands}'
+    return list(dict.fromkeys(out)), ''
+
+
+def _do_urgent(args, client, st, cfg, msg_id: str, targets: list, urgent_type: str, msg=None) -> tuple:
+    """对本人发出的 msg_id 加急; 校验、越权检查、审计都在这里。返回 (结果 dict, 错误)。msg: 已经查过的这条消息。"""
+    agent = is_agent_actor()
+    turn = state.read_turn() if agent else None
+    kind = URGENT_TYPE_NAMES[urgent_type]
+    if agent:
+        denied = _urgent_denied(turn, urgent_type)
+        if denied:
+            _audit(st, 'urgent', '', f'{kind}加急 {msg_id} → {" ".join(targets) or "(默认对象)"}', msg_id=msg_id,
+                   ok=False, error=denied)
+            from .notify import Notifier
+            Notifier(cfg, client).alert(f'拦下了数字人对消息 {msg_id} 的{kind}加急: {denied}',
+                                        key=f'deny-urgent:{msg_id}:{denied[:20]}', cooldown=600)
+            return None, denied
+    if msg is None:
+        try:
+            msg = client.get_messages([msg_id]).get(msg_id)
+        except Exception as e:
+            return None, f'查询消息失败: {e}'[:300]
+    if not msg or msg.get('recalled'):
+        return None, f'找不到消息 {msg_id}(不存在、已撤回, 或者本人看不到)'
+    if str(msg.get('from_id') or '') != str(client.auth.user_id):
+        return None, '只能加急本人自己发出的消息'
+    chat_id = str(msg.get('chat_id') or '')
+    if targets:
+        ids, err = _resolve_urgent_targets(client, targets)
+        if err:
+            return None, err
+    else:
+        try:
+            peer = client.p2p_peer(chat_id)
+        except Exception as e:
+            return None, f'查询会话失败: {e}'[:300]
+        if not peer:
+            return None, '群里加急要用 --to 指定加急谁(user_id 或名字, 可以写几个)'
+        ids = [peer]
+    if str(client.auth.user_id) in ids:
+        return None, '不能加急本人自己'
+    content = f'{kind}加急 {msg_id} → {" ".join(ids)}'
+    try:
+        res = client.put_urgent(msg_id, ids, urgent_type, chat_id=chat_id)
+    except Exception as e:
+        err = f'加急失败: {e}'[:300]
+        _audit(st, 'urgent', chat_id, content, msg_id=msg_id, ok=False, error=err)
+        return None, err
+    missed = [i for i in ids if i not in res['chatter_ids']]
+    error = f'这些人没加急上: {" ".join(missed)}' if missed else ''
+    _audit(st, 'urgent', chat_id, content, msg_id=msg_id, ok=not missed, error=error)
+    if agent and cfg.get('mirror'):
+        from .notify import Notifier, should_mirror
+        notifier = Notifier(cfg, client)
+        if should_mirror(chat_id, turn, notifier.owner_chat()):
+            name = st.get_chat_name(chat_id) or chat_id
+            notifier.send(f'⏰ 数字人在「{name}」对消息 {msg_id} 发了{kind}加急: {" ".join(ids)}', fallback=False)
+    return {'msg_id': msg_id, 'chat_id': chat_id, 'type': urgent_type, 'to': ids, 'urgent': res['chatter_ids'],
+            'missed': missed, 'invisible': res['invisible_chatter_ids']}, error
+
+
+def cmd_urgent(args):
+    """加急(飞书 buzz): 对本人发出的一条消息发应用内 / 短信 / 电话提醒。
+
+    已读: urgent.PutUrgentRequest 只带本人自己的消息 id、被加急的人、类型和会话 id, 没有已读位置字段, 也不拉取别人的消息;
+    实测(2026-11-06, 机器人私聊 7690645243804273642): 加急前后本人在会话里的 readPosition 不变(只有 send 本身把它推到了
+    自己那条)。当时会话里没有未读, 没测到"有未读时加急"的情形。消息撤回后加急随之结束, status 里显示为已确认。
+    """
+    target = list(args.target)
+    if target and target[0] == 'status':
+        return _urgent_status(args, target[1:])
+    if len(target) != 1 or not target[0].isdigit():
+        return _fail(args, '用法: larkx urgent <msg_id> [--to <user_id 或名字> ...] [--type app|sms|phone]; '
+                           'larkx urgent status <msg_id> ...(msg_id 是数字)')
+    client = LarkClient(LarkAuth())
+    res, err = _do_urgent(args, client, Storage(), load_config(), target[0], list(args.to or []), args.type)
+    if res is None:
+        return _fail(args, err)
+    if args.json:
+        _print_json({'ok': not err, **res, **({'error': err} if err else {})})
+    else:
+        print(f'已{URGENT_TYPE_NAMES[res["type"]]}加急 {res["msg_id"]} → {" ".join(res["urgent"]) or "(无)"}')
+        if err:
+            print(err, file=sys.stderr)
+    return 1 if err else 0
+
+
+def _urgent_status(args, ids: list) -> int:
+    ids = [str(i).strip() for i in ids]
+    if not ids or any(not i.isdigit() for i in ids):
+        return _fail(args, '用法: larkx urgent status <msg_id> ...(msg_id 是数字)')
+    try:
+        got = LarkClient(LarkAuth()).urgent_status(ids)
+    except Exception as e:
+        return _fail(args, f'查询加急状态失败: {e}'[:300])
+    rows = [{'msg_id': i, 'urgent': bool(got.get(i)), 'acks': got.get(i) or []} for i in ids]
+    if args.json:
+        _print_json({'ok': True, 'messages': rows})
+        return 0
+    for r in rows:
+        if not r['urgent']:
+            print(f'{r["msg_id"]}: 没有加急记录')
+            continue
+        for a in r['acks']:
+            when = f'{datetime.fromtimestamp(a["confirm_time"]):%m-%d %H:%M} 已确认' if a['acked'] else '未确认'
+            print(f'{r["msg_id"]} → {a["to"]}: {URGENT_TYPE_NAMES.get(a["type"], a["type"])}加急, {when}')
     return 0
 
 
@@ -1457,6 +1636,10 @@ def main():
     p.add_argument('--root', help='回复哪条消息: 普通群和私聊里是主会话里的引用回复(那条已在话题里时回进话题), 话题群里回进话题')
     p.add_argument('-m', '--markdown', action='store_true',
                    help='按 markdown 富文本发送: 代码块(```)、有序/无序列表、标题、引用、**加粗**、*斜体*、链接; 不带此选项时按纯文本发送')
+    p.add_argument('--urgent', action='store_true', help='发出后立即加急(应用内); 私聊默认加急对方, 群里要配 --urgent-to')
+    p.add_argument('--urgent-to', action='append', default=[], help='加急谁: user_id 或名字, 可重复; 带上它就会加急')
+    p.add_argument('--urgent-type', choices=['app', 'sms', 'phone'],
+                   help='加急类型, 默认 app(应用内); sms 短信、phone 电话可能计费, 要显式指定; 带上它就会加急')
     p.add_argument('--json', action='store_true')
     p.set_defaults(fn=cmd_send)
     p.add_argument('--mention', action='append', default=[], metavar='USER_ID:NAME',
@@ -1533,6 +1716,13 @@ def main():
     p.add_argument('msg_id')
     p.add_argument('--json', action='store_true')
     p.set_defaults(fn=cmd_recall)
+    p = sub.add_parser('urgent', help='加急本人发出的一条消息(应用内/短信/电话); urgent status <msg_id> 看谁确认了')
+    p.add_argument('target', nargs='+', help='<msg_id>; 或 status <msg_id> ...')
+    p.add_argument('--to', action='append', default=[], help='加急谁: user_id 或名字, 可重复; 私聊默认对方, 群里必填')
+    p.add_argument('--type', choices=['app', 'sms', 'phone'], default='app',
+                   help='app 应用内(默认); sms 短信、phone 电话可能计费, 要显式指定, 数字人不能用')
+    p.add_argument('--json', action='store_true')
+    p.set_defaults(fn=cmd_urgent)
     p = sub.add_parser('takeover', help='接管会话: 一段时间内对方的消息都交给数字人回复')
     p.add_argument('action', choices=['start', 'stop', 'list'])
     p.add_argument('chat_id', nargs='?')

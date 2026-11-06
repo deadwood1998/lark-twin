@@ -535,6 +535,61 @@ class LarkClient:
         resp = self.api(req, {'messageId': str(msg_id), 'reactionType': str(reaction_type)}) or {}
         return int(resp.get('count') or 0)
 
+    URGENT_TYPES = {'app': 'APP', 'sms': 'SMS', 'phone': 'PHONE'}
+
+    def put_urgent(self, msg_id: str, chatter_ids, urgent_type: str = 'app', chat_id: str = '') -> dict:
+        """对一条本人发出的消息加急(urgent.PutUrgentRequest, cmd 30000; 飞书客户端"加急"用的就是它, 加急后 WS 会推
+        cmd 30002 urgent.PushUrgentRequest)。urgent_type: app 应用内 / sms 短信 / phone 电话(后两种可能计费)。
+        返回 {'urgent_id', 'type', 'chatter_ids': 服务端接受的人, 'invisible_chatter_ids': 看不到这条消息、没加急上的人,
+        'ack_ids': {chatter_id: ack_id}}; 请求失败、服务端拒绝时抛异常。
+
+        请求里只有消息 id、被加急的人、类型和会话 id, 没有已读位置之类的字段; 加急的是本人自己的消息, 不读别人的消息,
+        不会产生已读回执(实测见 cli.cmd_urgent 的说明)。
+        """
+        ids = [str(c) for c in chatter_ids if c]
+        kind = self.URGENT_TYPES[urgent_type]
+        data = {'messageId': str(msg_id), 'chatterIds': ids, 'urgentType': kind,
+                'urgentChatterGroups': [{'chatterIds': ids, 'urgentType': kind}], 'selectType': 'SELECT_SOME_CHATTER'}
+        if chat_id:
+            data['chatId'] = str(chat_id)
+        resp = self.api('urgent.PutUrgentRequest', data) or {}
+        urgent = resp.get('urgent') or {}
+        return {'urgent_id': str(urgent.get('messageId') or ''), 'type': urgent.get('type'),
+                'chatter_ids': [str(c) for c in resp.get('chatterIds') or []],
+                'invisible_chatter_ids': [str(c) for c in resp.get('invisibleChatterIds') or []],
+                'ack_ids': {str(k): str(v) for k, v in (resp.get('urgentAckIds') or {}).items()}}
+
+    URGENT_TYPE_KEYS = {1: 'app', 2: 'sms', 3: 'phone'}
+
+    def urgent_status(self, message_ids) -> dict:
+        """这些消息的加急确认情况(urgent.PullUrgentsAckStatusRequest, 只读): {msg_id: [{'to': 被加急的人, 'type': app/sms/phone,
+        'acked': 是否已确认, 'send_time', 'confirm_time'}]}; 没加急过的消息不在里面。
+
+        实测(2026-11-06): 结果在 urgentAcks 里(urgentStatus、phoneStatus 是空的), 每个被加急的人一条 UrgentAck;
+        status 1 是已确认(带 confirmTime), 2 是还没确认。
+        """
+        ids = [str(m) for m in message_ids if m]
+        resp = self.api('urgent.PullUrgentsAckStatusRequest', {'messageIds': ids}) or {}
+        out = {}
+        for k, v in (resp.get('urgentAcks') or {}).items():
+            acks = []
+            for a in (v or {}).get('urgentAckList') or []:
+                acks.append({'to': str(a.get('toId') or ''), 'type': self.URGENT_TYPE_KEYS.get(a.get('type'), str(a.get('type'))),
+                             'acked': a.get('status') == 1, 'send_time': int(a.get('sendTime') or 0),
+                             'confirm_time': int(a.get('confirmTime') or 0)})
+            if acks:
+                out[str(k)] = acks
+        return out
+
+    def p2p_peer(self, chat_id: str) -> str:
+        """私聊会话里对方的 user_id; 不是私聊或查不到时返回空串。"""
+        info = self.get_chat_info(chat_id) or {}
+        if info.get('type') not in (1, 'P2P'):
+            return ''
+        me = str(self.auth.user_id)
+        peers = [x for x in str(info.get('key') or '').split(':') if x and x != me]
+        return peers[0] if peers else ''
+
     def get_messages(self, message_ids) -> dict:
         """按 id 只读地取消息(messages.PullMessagesByIdsRequest, 不改变已读状态), {msg_id: 消息}, 格式同 pull_history;
         取不到的(不存在、本人看不到)不在里面。"""

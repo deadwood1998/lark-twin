@@ -93,6 +93,22 @@ larkx takeover stop <chat_id> --json
 larkx mentions --since 24h --json    # 别人的私聊、@本人的群消息；replied=false 表示本人还没回
 ```
 
+## 加急（只有本人发起时可用）
+
+```bash
+larkx urgent <msg_id> --json                          # 应用内加急；私聊默认加急对方
+larkx urgent <msg_id> --to <user_id 或名字> --json     # 群里必须用 --to 指定加急谁，可以写几个
+larkx send <chat_id> --urgent [--urgent-to <user_id>] --json - <<'EOF'   # 发出后立即加急
+...
+EOF
+larkx urgent status <msg_id> --json                   # 谁确认了加急（acked）
+```
+
+- 只能加急本人自己发出的消息（包括你以本人身份发的）。
+- 只有本人发起的一轮能加急；访客的请求、`<system>` 维护任务、汇报里都不能加急，会被拒绝并通知本人。**加急前要先和本人确认加急哪条、加急谁**，除非本人已经明确给出。
+- 你只能用应用内加急；短信、电话（`--type sms|phone`）可能计费，会被拒绝，需要本人自己在终端里执行。
+- `--urgent` 被拒绝时消息也不会发出；消息发出但加急失败时退出码非零，`error` 里会说明，不要重发消息，直接对 `msg_id` 补一次 `larkx urgent`。
+
 ## 撤回
 
 ```bash
