@@ -1,7 +1,9 @@
-"""Codex 后端: 每条消息起一个 `codex exec`, 用 `resume <thread_id>` 接着同一个会话。
+"""Codex 后端: 每条消息起一个 `codex exec`, 需要接着聊时用 `resume <thread_id>`。
 
-Codex 没有像 Agent SDK 那样的常驻流式接口(app-server 仍是实验性), 会话的连续性靠
-同一个 thread 的会话记录; 上下文压缩由 Codex 自己完成。
+会话策略(LARKX_AGENT_SESSION, 留空时由记忆策略决定, 见 larkx/plugins/memory/):
+- single(上游): 所有消息进同一个 thread, 上下文压缩由 Codex 自己完成。
+- chat: 按调用方给的 key 分 thread(如每个飞书会话一个), 和它上次交流超过 LARKX_AGENT_SESSION_IDLE 秒就开新 thread;
+  key 为 None 的轮次(维护轮)每次都开新 thread。新 thread 最前面放调用方给的说明(note), 由记忆策略告诉它怎么接上前情。
 """
 import asyncio
 import glob
@@ -18,6 +20,7 @@ from ..config import ACTOR_ENV
 from .base import SessionCrashed, TurnResult, agent_path, resolve_agent_cli
 
 SESSION_KEY = 'main:codex'
+CHAT_KEY_PREFIX = 'codex:'
 # 从用户自己的 Codex 配置里沿用的项: 只取模型供应商相关, hooks / MCP / memories 等一律不带进来
 COPIED_CONFIG_KEYS = ('model_provider', 'model_providers')
 
@@ -134,6 +137,8 @@ class CodexSession:
         self.home = Path(cfg['agent_home'])
         self.codex_home = Path(cfg['agent_codex_dir'])
         self.cli = resolve_agent_cli(cfg.get('codex_cli') or 'codex')
+        self.mode = cfg.get('agent_session') or 'single'
+        self.idle = int(cfg.get('agent_session_idle') or 7200)
         self.session_id = ''
         self.busy = False
         self.events = []
@@ -146,6 +151,9 @@ class CodexSession:
 
     async def start(self):
         ensure_codex_home(self.cfg)
+        if self.mode != 'single':
+            logger.info(f'数字人会话(codex): 每个会话一个 thread, 空闲 {self.idle} 秒后开新的; 维护轮每次开新的')
+            return
         row = self.storage.session_get(SESSION_KEY)
         if row and self._rollout_exists(row.agent_session_id):
             self.session_id = row.agent_session_id
@@ -153,36 +161,65 @@ class CodexSession:
         else:
             logger.info('数字人会话(codex)将在第一条消息时创建')
 
-    def _args(self) -> list:
-        args = [self.cli, 'exec'] + (['resume', self.session_id] if self.session_id else [])
-        args += ['--json', '--skip-git-repo-check', '--dangerously-bypass-approvals-and-sandbox',
-                 '-c', f'shell_environment_policy.set.{ACTOR_ENV}="agent"']
+    def _storage_key(self, key):
+        """这一轮用哪个存储键接着聊; None 表示开新 thread、用完不留。"""
+        if self.mode == 'single':
+            return SESSION_KEY
+        return CHAT_KEY_PREFIX + key if key else None
+
+    def _resume_id(self, skey) -> str:
+        if not skey:
+            return ''
+        row = self.storage.session_get(skey)
+        if not row or not self._rollout_exists(row.agent_session_id):
+            return ''
+        if self.mode != 'single' and row.last_active and time.time() - row.last_active.timestamp() > self.idle:
+            return ''
+        return row.agent_session_id
+
+    def _args(self, resume_id: str = '', sandbox_dir: str = '') -> list:
+        args = [self.cli, 'exec'] + (['resume', resume_id] if resume_id else [])
+        args += ['--json', '--skip-git-repo-check']
+        if sandbox_dir:
+            # 只能写这个目录、不能联网: 处理的是别人发的原始消息, 里面的指令不能变成真的操作
+            args += ['-s', 'workspace-write', '-C', sandbox_dir, '-c', 'sandbox_workspace_write.network_access=false']
+        else:
+            args += ['--dangerously-bypass-approvals-and-sandbox']
+        args += ['-c', f'shell_environment_policy.set.{ACTOR_ENV}="agent"']
         if self.cfg.get('agent_model'):
             args += ['-m', self.cfg['agent_model']]
         return args + ['-']
 
-    async def ask(self, prompt: str) -> TurnResult:
+    async def ask(self, prompt: str, key=None, note=None, sandbox_dir: str = '') -> TurnResult:
+        """key: 这一轮属于哪个会话(如 chat:<chat_id>), None 表示开新 thread、用完不留(single 模式下忽略, 都进同一个 thread);
+        note: chat 模式开了新 thread 时放在最前面的说明, 不给就不加;
+        sandbox_dir: 非空时这一轮开新 thread, 在沙箱里跑, 只能写这个目录、不能联网。"""
         async with self._lock:
             self.busy = True
             self._interrupted = False
             started = time.monotonic()
+            skey = None if sandbox_dir else self._storage_key(key)
+            resume_id = self._resume_id(skey)
+            if not resume_id and self.mode != 'single' and note:
+                prompt = note + prompt
+            self.session_id = resume_id
             env = dict(os.environ, CODEX_HOME=str(self.codex_home), PATH=agent_path())
             env[ACTOR_ENV] = 'agent'
             try:
                 self._proc = await asyncio.create_subprocess_exec(
-                    *self._args(), cwd=str(self.home), env=env, limit=16 * 1024 * 1024,
+                    *self._args(resume_id, sandbox_dir), cwd=str(self.home), env=env, limit=16 * 1024 * 1024,
                     stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
                 self._proc.stdin.write(prompt.encode('utf-8'))
                 await self._proc.stdin.drain()
                 self._proc.stdin.close()
-                return await self._finish(started)
+                return await self._finish(started, skey)
             except OSError as e:
                 raise SessionCrashed(f'启动 codex 失败: {e!r}') from e
             finally:
                 self.busy = False
                 self._proc = None
 
-    async def _finish(self, started: float) -> TurnResult:
+    async def _finish(self, started: float, skey=SESSION_KEY) -> TurnResult:
         parser = CodexTurnParser()
         stderr_task = asyncio.create_task(self._proc.stderr.read())
 
@@ -206,9 +243,11 @@ class CodexSession:
         stderr = (await stderr_task).decode('utf-8', errors='replace')
         if parser.thread_id and parser.thread_id != self.session_id:
             self.session_id = parser.thread_id
-            self.storage.session_upsert(SESSION_KEY, '', '', self.session_id, True)
-        if self.session_id:
-            self.storage.session_touch(SESSION_KEY)
+            if skey:
+                chat_id = skey.split('chat:', 1)[1] if skey.startswith(CHAT_KEY_PREFIX + 'chat:') else ''
+                self.storage.session_upsert(skey, chat_id, '', self.session_id, True)
+        if self.session_id and skey:
+            self.storage.session_touch(skey)
         text = '\n'.join(t for t in parser.texts if t).strip()
         duration = time.monotonic() - started
         if parser.completed:
@@ -234,6 +273,9 @@ class CodexSession:
         async with self._lock:
             self.session_id = ''
             self.storage.session_upsert(SESSION_KEY, '', '', '', False)
+            for row in self.storage.list_sessions(limit=10000):
+                if row.session_key.startswith(CHAT_KEY_PREFIX) and row.agent_session_id:
+                    self.storage.session_upsert(row.session_key, row.chat_id, '', '', False)
         logger.info('数字人会话(codex)已重置, 下一条消息开新会话')
 
     async def close(self):

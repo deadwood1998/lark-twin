@@ -1,17 +1,19 @@
 import argparse
 import json
+import os
 import sys
 import time
 from datetime import datetime, timedelta
 from loguru import logger
-from . import state
+from . import plugins, state
 from .config import inside_twin, is_agent_actor, load_config, with_signature
 from .protocol import REGIONS, AuthExpired, LarkAuth, LarkClient, get_region
 from .storage import Storage
 
 # 数字人(LARKX_ACTOR=agent)不能用的子命令: 原始网关接口、登录凭证、再起一个监听进程、管理自己的服务、
 # 以本人身份给自己下指令(say)、改本机 agent 的 skill
-AGENT_FORBIDDEN = {'api', 'auth', 'listen', 'daemon', 'service', 'doctor', 'say', 'skill', 'web', 'prune', 'backfill'}
+AGENT_FORBIDDEN = {'api', 'auth', 'listen', 'daemon', 'service', 'doctor', 'say', 'skill', 'web', 'prune', 'backfill',
+                   'plugin'}
 
 
 def _print_json(obj):
@@ -173,6 +175,8 @@ def _read_send_text(args) -> str:
 
 # 对外发出消息的动作: 数字人的发送上限把它们合起来算, 发出去的消息都能撤回
 SENT_ACTIONS = ('send', 'forward')
+# 算进数字人发送上限的动作: 再加上回复云文档评论(走 lark-cli, 不能用 larkx recall 撤回)
+RATE_LIMITED_ACTIONS = (*SENT_ACTIONS, 'doc_reply')
 FORWARD_MAX = 50
 
 
@@ -183,9 +187,136 @@ def _audit(st, action, args_chat, content, msg_id='', ok=True, error=''):
                   turn_kind=(turn or {}).get('kind', ''), turn_ref=(turn or {}).get('ref', ''))
 
 
-def cmd_send(args):
+def cmd_doc(args):
+    """云文档: read 读正文, comment 看一条评论的上下文, reply 在评论下回复(走 lark-cli, 以本人身份)。"""
+    from . import doc_comments
+    if args.action == 'reply':
+        return _doc_reply(args)
+    if args.action == 'comment' and not args.comment_id:
+        return _fail(args, 'larkx doc comment 要给评论 ID')
+    st = Storage()
+    try:
+        if args.action == 'read':
+            content = doc_comments.read(load_config(), st, args.chat_id)
+            if args.json:
+                _print_json({'ok': True, 'chat_id': args.chat_id, 'title': st.get_chat_name(args.chat_id), 'content': content})
+            else:
+                print(content)
+            return 0
+        thread = doc_comments.comment(load_config(), st, args.chat_id, args.comment_id)
+    except doc_comments.DocError as e:
+        return _fail(args, str(e))
+    if args.json:
+        _print_json({'ok': True, **thread})
+    else:
+        print(f"评论 {thread['comment_id']}{'(已解决)' if thread['is_solved'] else ''} 评的原文: {thread['quote'] or '(全文评论)'}")
+        for r in thread['replies']:
+            print(f"- {r['from']}: {r['text']}")
+    return 0
+
+
+def _doc_reply(args):
+    """在云文档评论下以本人身份回复; 管控和 send 一样: 防自回环、只能回触发这一轮的文档、发送上限、签名、抄送。"""
+    from . import doc_comments
+    from .protocol.proto.decoders import DOC_CHAT_TYPE
+    if not args.comment_id:
+        return _fail(args, 'larkx doc reply 要给评论 ID')
     text = _read_send_text(args)
     if not text.strip():
+        return _fail(args, '回复内容为空')
+    cfg = load_config()
+    prefix = (cfg.get('triggers') or {}).get('prefix') or ''
+    st = Storage()
+    agent = is_agent_actor()
+    turn = state.read_turn() if agent else None
+    client = LarkClient(LarkAuth())
+    name = st.get_chat_name(args.chat_id) or args.chat_id
+    if agent:
+        from .daemon.triggers import strip_mentions
+        from .notify import Notifier
+        denied = f'数字人的回复不能以触发前缀 {prefix} 开头' if prefix and strip_mentions(text).startswith(prefix) else ''
+        denied = denied or state.send_denied(args.chat_id, turn)
+        if not denied:
+            n = st.count_actions('agent', RATE_LIMITED_ACTIONS, datetime.now() - timedelta(minutes=10))
+            if n >= cfg['send_rate_limit']:
+                denied = f'数字人 10 分钟内已经发了 {n} 条消息, 达到上限 {cfg["send_rate_limit"]}(LARKX_SEND_RATE_LIMIT)'
+        if denied:
+            _audit(st, 'doc_reply', args.chat_id, text, ok=False, error=denied)
+            Notifier(cfg, client).alert(f'拦下了数字人在云文档「{name}」的评论回复: {denied}\n内容: {text[:200]}',
+                                        key=f'deny:{args.chat_id}:{denied[:20]}', cooldown=600)
+            return _fail(args, denied)
+        text = with_signature(text, cfg)
+    try:
+        reply_id = doc_comments.reply(cfg, st, args.chat_id, args.comment_id, text)
+    except doc_comments.DocError as e:
+        _audit(st, 'doc_reply', args.chat_id, text, ok=False, error=str(e))
+        return _fail(args, str(e))
+    _audit(st, 'doc_reply', args.chat_id, text, msg_id=reply_id)
+    if agent and cfg.get('mirror'):
+        from .notify import Notifier, should_mirror
+        notifier = Notifier(cfg, client)
+        if should_mirror(args.chat_id, turn, notifier.owner_chat()):
+            notifier.send(f'📤 数字人在云文档「{name}」的评论下回复了:\n{text}', fallback=False)
+    # 和 send 一样落库, 本地记录里看得到这篇文档下发过什么
+    if reply_id:
+        st.save_message({'msg_id': reply_id, 'chat_id': args.chat_id, 'chat_type': DOC_CHAT_TYPE, 'scope': 'topic',
+                         'anchor': args.comment_id, 'from_id': client.auth.user_id, 'msg_type_name': 'DOC_REPLY',
+                         'content': text, 'create_time': int(datetime.now().timestamp())}, sender_name='我', direction='out')
+    if args.json:
+        _print_json({'ok': True, 'reply_id': reply_id})
+    else:
+        print(f'已回复 {reply_id}'.rstrip())
+    return 0
+
+
+# 这些后缀、不超过这个大小的文件按图片消息发, 其余按文件消息发
+SEND_IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.gif', '.webp'}
+SEND_IMAGE_MAX = 10 * 1024 * 1024
+
+
+def _send_files(args) -> tuple:
+    """--file 给的文件: 返回 ([{path, name, size, mime, image}], 错误)。只查文件本身, 越权由 guest.send_file_denied 查。"""
+    import mimetypes
+    files = []
+    for path in getattr(args, 'file', None) or []:
+        full = os.path.abspath(os.path.expanduser(path))
+        if not os.path.isfile(full):
+            return [], f'找不到文件(或不是普通文件): {path}'
+        size = os.path.getsize(full)
+        if size <= 0:
+            return [], f'不能发送空文件: {path}'
+        name = os.path.basename(full)
+        mime = mimetypes.guess_type(name)[0] or 'application/octet-stream'
+        image = os.path.splitext(name)[1].lower() in SEND_IMAGE_EXTS and size <= SEND_IMAGE_MAX
+        files.append({'path': path, 'full': full, 'name': name, 'size': size, 'mime': mime, 'image': image})
+    return files, ''
+
+
+def _file_label(f: dict) -> str:
+    return f'[图片] {f["name"]}' if f['image'] else f'[文件] {f["name"]}'
+
+
+def _send_one_file(client, f: dict, chat_id: str, root, cfg, thread):
+    """上传一个文件再发出去, 返回 (消息, msg_id); 上传失败抛 media.UploadError。"""
+    from .protocol import media
+    if f['image']:
+        with open(f['full'], 'rb') as fh:
+            key = media.upload_image(client.auth, fh.read(), f['name'], f['mime'])
+        msg = {'kind': 'image', 'key': key}
+    else:
+        with open(f['full'], 'rb') as fh:
+            key = media.upload_file(client.auth, fh, f['size'], f['name'], f['mime'])
+        msg = {'kind': 'file', 'key': key, 'name': f['name'], 'size': f['size'], 'mime': f['mime']}
+    return msg, client.send_message(msg, chat_id, root_id=root, keep_unread=cfg['keep_unread'], in_thread=thread)
+
+
+def cmd_send(args):
+    files, error = _send_files(args)
+    if error:
+        return _fail(args, error)
+    # 只发文件时不读 stdin(没有内容时 stdin 可能一直不结束); 要同时发文字就写在参数里或写 -
+    text = _read_send_text(args) if (args.text or not files) else ''
+    if not text.strip() and not files:
         return _fail(args, '消息内容为空')
     mentions=[]
     for value in getattr(args, 'mention', []) or []:
@@ -193,6 +324,11 @@ def cmd_send(args):
         if not sep or not uid.isdigit() or not name.strip():
             return _fail(args, '--mention 格式为数字 user_id:显示名')
         mentions.append({'type':'at','user_id':uid,'name':name})
+    if mentions and not text.strip():
+        return _fail(args, '--mention 要和文字内容一起发')
+    has_text = bool(text.strip())
+    labels = '\n'.join(_file_label(f) for f in files)
+    summary = '\n'.join(x for x in (text, labels) if x)  # 审计、告警里记的内容
     cfg = load_config()
     prefix = (cfg.get('triggers') or {}).get('prefix') or ''
     st = Storage()
@@ -225,68 +361,114 @@ def cmd_send(args):
         from .protocol import richtext
         plain = richtext.to_plain_text(text)
     if agent:
+        from . import guest
         from .daemon.triggers import strip_mentions
         from .notify import Notifier
+        # 文件先查: 凭证、密钥不能发; 访客这一轮只能发数字人 downloads/ 里的文件
+        denied = next((d for d in (guest.send_file_denied(f['path'], cfg, turn) for f in files) if d), '')
         # 允许自己触发时, 以前缀开头的回复会再次触发数字人, 形成自回环
-        denied = f'数字人的回复不能以触发前缀 {prefix} 开头' if prefix and strip_mentions(plain).startswith(prefix) else ''
+        if not denied and has_text and prefix and strip_mentions(plain).startswith(prefix):
+            denied = f'数字人的回复不能以触发前缀 {prefix} 开头'
         denied = denied or state.send_denied(args.chat_id, turn)
         if not denied:
-            n = st.count_actions('agent', SENT_ACTIONS, datetime.now() - timedelta(minutes=10))
-            if n >= cfg['send_rate_limit']:
+            n = st.count_actions('agent', RATE_LIMITED_ACTIONS, datetime.now() - timedelta(minutes=10))
+            count = int(has_text) + len(files)
+            if n + count > cfg['send_rate_limit']:
                 denied = f'数字人 10 分钟内已经发了 {n} 条消息, 达到上限 {cfg["send_rate_limit"]}(LARKX_SEND_RATE_LIMIT)'
         if denied:
-            _audit(st, 'send', args.chat_id, text, ok=False, error=denied)
+            _audit(st, 'send', args.chat_id, summary, ok=False, error=denied)
             name = st.get_chat_name(args.chat_id) or args.chat_id
-            Notifier(cfg, client).alert(f'拦下了数字人发往「{name}」的消息: {denied}\n内容: {text[:200]}',
+            Notifier(cfg, client).alert(f'拦下了数字人发往「{name}」的消息: {denied}\n内容: {summary[:200]}',
                                         key=f'deny:{args.chat_id}:{denied[:20]}', cooldown=600)
             return _fail(args, denied)
-        text = with_signature(text, cfg)
-        if getattr(args, 'markdown', False):
-            from .protocol import richtext
-            plain = richtext.to_plain_text(text)
-    if mentions:
-        # 正文里写了 "@显示名" 的就地变成 @, 没写到的放在最前面(见 protocol/mentions.py)
-        from .protocol import mentions as mention_mod
-        from .protocol.proto import builders
-        if getattr(args, 'markdown', False):
-            msg = {'kind': 'markdown', 'text': text, 'mentions': mentions}
+        if has_text:
+            text = with_signature(text, cfg)
+            if getattr(args, 'markdown', False):
+                from .protocol import richtext
+                plain = richtext.to_plain_text(text)
+    # --thread: 普通群里回进以 --root 为根的话题(还没有话题就新开一个), 而不是主会话里的引用回复
+    thread = True if getattr(args, 'thread', False) else None
+    if thread and not args.root:
+        return _fail(args, '--thread 要和 --root 一起用: 指定回进哪条消息的话题')
+    markdown = getattr(args, 'markdown', False)
+    sent = []  # 发出去的 (msg_id, 抄送里记的内容)
+    if has_text:
+        if mentions:
+            # 正文里写了 "@显示名" 的就地变成 @, 没写到的放在最前面(见 protocol/mentions.py)
+            from .protocol import mentions as mention_mod
+            from .protocol.proto import builders
+            if markdown:
+                msg = {'kind': 'markdown', 'text': text, 'mentions': mentions}
+            else:
+                msg = {'kind': 'text', 'segments': mention_mod.text_segments(text, mentions)}
+            msg_id = client.send_message(msg, args.chat_id, root_id=args.root, keep_unread=cfg['keep_unread'],
+                                         in_thread=thread)
+            # 审计、抄送、落库里的纯文本: @ 写成 "@显示名", 位置和发出去的一致
+            if markdown:
+                plain = builders.plain_text(msg)
+                text = mention_mod.lead_text(mention_mod.markdown_unplaced(text, mentions)) + text
+            else:
+                text = builders.plain_text(msg)
+        elif thread:
+            msg_id = client.send_message({'kind': 'markdown' if markdown else 'text', 'text': text}, args.chat_id,
+                                         root_id=args.root, keep_unread=cfg['keep_unread'], in_thread=True)
+        elif markdown:
+            msg_id = client.send_markdown(text, args.chat_id, root_id=args.root, keep_unread=cfg['keep_unread'])
         else:
-            msg = {'kind': 'text', 'segments': mention_mod.text_segments(text, mentions)}
-        msg_id = client.send_message(msg, args.chat_id, root_id=args.root, keep_unread=cfg['keep_unread'])
-        # 审计、抄送、落库里的纯文本: @ 写成 "@显示名", 位置和发出去的一致
-        if getattr(args, 'markdown', False):
-            plain = builders.plain_text(msg)
-            text = mention_mod.lead_text(mention_mod.markdown_unplaced(text, mentions)) + text
+            msg_id = client.send_msg(text, args.chat_id, root_id=args.root, keep_unread=cfg['keep_unread'])
+        _audit(st, 'send', args.chat_id, text, msg_id=msg_id, ok=bool(msg_id), error='' if msg_id else '发送失败')
+        if not msg_id:
+            return _fail(args, '发送失败')
+        sent.append((msg_id, text))
+        # 用服务端 id 落库,监听收到回显时会补全这条而不是再插一条
+        st.save_message({'msg_id': msg_id, 'chat_id': args.chat_id, 'chat_type': 0, 'scope': 'topic' if args.root else 'chat', 'anchor': args.root or '', 'from_id': client.auth.user_id, 'msg_type': 2 if getattr(args, 'markdown', False) else 4, 'msg_type_name': 'POST' if getattr(args, 'markdown', False) else 'TEXT', 'content': plain if getattr(args, 'markdown', False) else text, 'content_data': {'_larkx_mention_ids': [m['user_id'] for m in mentions]}, 'create_time': int(datetime.now().timestamp())}, sender_name='我', direction='out')
+    error = ''
+    for f in files:
+        label = _file_label(f)
+        try:
+            msg, msg_id = _send_one_file(client, f, args.chat_id, args.root, cfg, thread)
+            error = '' if msg_id else f'{f["name"]} 发送失败'
+        except Exception as e:
+            msg, msg_id, error = None, None, f'上传 {f["name"]} 失败: {e}'[:300]
+        _audit(st, 'send', args.chat_id, label, msg_id=msg_id or '', ok=bool(msg_id), error=error)
+        if not msg_id:
+            break
+        sent.append((msg_id, label))
+        if msg['kind'] == 'image':
+            data, mtype = {'imageV2': {'imageKey': msg['key']}}, (5, 'IMAGE')
         else:
-            text = builders.plain_text(msg)
-    elif getattr(args, 'markdown', False):
-        msg_id = client.send_markdown(text, args.chat_id, root_id=args.root, keep_unread=cfg['keep_unread'])
-    else:
-        msg_id = client.send_msg(text, args.chat_id, root_id=args.root, keep_unread=cfg['keep_unread'])
-    _audit(st, 'send', args.chat_id, text, msg_id=msg_id, ok=bool(msg_id), error='' if msg_id else '发送失败')
-    if not msg_id:
-        return _fail(args, '发送失败')
-    if agent and cfg.get('mirror'):
+            data, mtype = {k: msg[k] for k in ('key', 'name', 'size', 'mime')}, (3, 'FILE')
+        st.save_message({'msg_id': msg_id, 'chat_id': args.chat_id, 'chat_type': 0, 'scope': 'topic' if args.root else 'chat', 'anchor': args.root or '', 'from_id': client.auth.user_id, 'msg_type': mtype[0], 'msg_type_name': mtype[1], 'content': label, 'content_data': data, 'create_time': int(datetime.now().timestamp())}, sender_name='我', direction='out')
+    if agent and cfg.get('mirror') and sent:
         from .notify import Notifier, should_mirror
         notifier = Notifier(cfg, client)
         if should_mirror(args.chat_id, turn, notifier.owner_chat()):
             name = st.get_chat_name(args.chat_id) or args.chat_id
-            notifier.send(f'📤 数字人在「{name}」发了:\n{text}', fallback=False)
-    # 用服务端 id 落库,监听收到回显时会补全这条而不是再插一条
-    st.save_message({'msg_id': msg_id, 'chat_id': args.chat_id, 'chat_type': 0, 'scope': 'topic' if args.root else 'chat', 'anchor': args.root or '', 'from_id': client.auth.user_id, 'msg_type': 2 if getattr(args, 'markdown', False) else 4, 'msg_type_name': 'POST' if getattr(args, 'markdown', False) else 'TEXT', 'content': plain if getattr(args, 'markdown', False) else text, 'content_data': {'_larkx_mention_ids': [m['user_id'] for m in mentions]}, 'create_time': int(datetime.now().timestamp())}, sender_name='我', direction='out')
+            notifier.send(f'📤 数字人在「{name}」发了:\n' + '\n'.join(c for _, c in sent), fallback=False)
+    ids = [m for m, _ in sent]
+    if error:
+        if args.json:
+            _print_json({'ok': False, 'error': error, 'msg_ids': ids, 'chat_id': args.chat_id})
+        else:
+            print(f'{error}' + (f'; 已发出 msg_id={" ".join(ids)}' if ids else ''), file=sys.stderr)
+        return 1
+    msg_id = ids[0]
     urgent, urgent_err = None, ''
     if urgent_type:
+        # 加急发出的第一条(有文字时是文字那条)
         mine = {'msg_id': msg_id, 'chat_id': args.chat_id, 'from_id': client.auth.user_id, 'recalled': False}
         urgent, urgent_err = _do_urgent(args, client, st, cfg, msg_id, urgent_to, urgent_type, msg=mine)
     if args.json:
         out = {'ok': not urgent_err, 'msg_id': msg_id, 'chat_id': args.chat_id}
+        if files:
+            out['msg_ids'] = ids   # 带了文件时每条消息的 id 按发出顺序
         if urgent_type:
             out['urgent'] = urgent
         if urgent_err:
             out['error'] = f'消息已发出, 加急没成功: {urgent_err}'
         _print_json(out)
     else:
-        print(f'已发送 msg_id={msg_id}')
+        print(f'已发送 msg_id={" ".join(ids)}')
         if urgent:
             print(f'已{URGENT_TYPE_NAMES[urgent_type]}加急 → {" ".join(urgent["urgent"]) or "(无)"}')
         if urgent_err:
@@ -308,7 +490,7 @@ def _forward_denied(st, cfg, sources: list, targets: list, turn, count: int, mer
         from .daemon.triggers import strip_mentions
         if any(strip_mentions(m['content']).startswith(prefix) for m in sources):
             return f'数字人不能逐条转发以触发前缀 {prefix} 开头的消息'
-    n = st.count_actions('agent', SENT_ACTIONS, datetime.now() - timedelta(minutes=10))
+    n = st.count_actions('agent', RATE_LIMITED_ACTIONS, datetime.now() - timedelta(minutes=10))
     if n + count > cfg['send_rate_limit']:
         return (f'数字人 10 分钟内已经发了 {n} 条消息, 再转发 {count} 条会超过上限 {cfg["send_rate_limit"]}'
                 '(LARKX_SEND_RATE_LIMIT)')
@@ -565,6 +747,12 @@ def cmd_groups(args):
     except ValueError as e:
         return _fail(args, str(e))
     return (_print_json({'ok': True, 'message': msg}) or 0) if args.json else (print(msg) or 0)
+
+
+def _since_ts(text: str, now: float) -> int:
+    """'1h' / '30m' 这类时长(往前推), 或 unix 秒。"""
+    text = str(text).strip()
+    return int(text) if text.isdigit() and len(text) >= 9 else int(now - state.parse_duration(text))
 
 
 def cmd_sessions(args):
@@ -978,6 +1166,65 @@ def cmd_rule(args):
     return 0
 
 
+def cmd_ping(args):
+    """数字人判断某件事要本人亲自处理: 记进本人收件箱(state/owner_inbox.jsonl), 本人那边实时能看到。"""
+    from . import owner_inbox
+    text = ' '.join(args.text).strip()
+    if text in ('', '-'):
+        text = sys.stdin.read().strip()
+    if not text:
+        return _fail(args, '要写清楚需要本人处理什么')
+    turn = state.read_turn() or {}
+    chat_id = args.chat or turn.get('chat_id') or ''
+    msg_id = args.msg or (turn.get('ref') if turn.get('kind') == 'message' else '') or ''
+    st = Storage()
+    entry = owner_inbox.append('ping', text, chat_id=chat_id, chat_name=st.get_chat_name(chat_id) or '' if chat_id else '',
+                               msg_id=msg_id, root_id=turn.get('anchor') or '')
+    if args.json:
+        _print_json(entry)
+    else:
+        print('已通知本人')
+    return 0
+
+
+def cmd_inbox(args):
+    """本人收件箱: 数字人判断要本人处理的事、别人 @ 本人的消息。"""
+    from . import owner_inbox
+    items = owner_inbox.recent(_since_ts(args.since, time.time()))
+    if args.json:
+        _print_json(items)
+        return 0
+    for e in items:
+        print(owner_inbox.format_entry(e))
+    if not items:
+        print('没有')
+    return 0
+
+
+def cmd_watch(args):
+    """本人在线: 实时打印收件箱新增的条目; 运行期间别人发起的轮次数字人只判断要不要本人处理(larkx ping), 不回复、不执行。
+    Ctrl+C 退出后恢复数字人正常回复。"""
+    import atexit
+    import signal
+    from . import owner_inbox
+    if owner_inbox.watching():
+        return _fail(args, '已经有一个 larkx watch 在运行')
+    owner_inbox.start_watch()
+    atexit.register(owner_inbox.stop_watch)
+    signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))
+    since = _since_ts(args.since, time.time()) if args.since else None
+    if not args.json:
+        print('本人在线: 别人的消息数字人只判断、写收件箱, 不回复也不执行; Ctrl+C 退出后恢复。', flush=True)
+    try:
+        for e in owner_inbox.follow(since):
+            print(json.dumps(e, ensure_ascii=False) if args.json else owner_inbox.format_entry(e), flush=True)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        owner_inbox.stop_watch()
+    return 0
+
+
 def cmd_mentions(args):
     import time
     try:
@@ -992,10 +1239,10 @@ def cmd_mentions(args):
         return 0
     for r in rows:
         when = datetime.fromtimestamp(r['create_time']).strftime('%m-%d %H:%M') if r['create_time'] else ''
-        where = '私聊' if r['kind'] == 'p2p' else f"「{r['chat_name'] or r['chat_id']}」@你"
+        where = '私聊' if r['kind'] == 'p2p' else f"「{r['chat_name'] or r['chat_id']}」{'回你' if r['kind'] == 'reply' else '@你'}"
         print(f"{when} {'  ' if r['replied'] else '● '}{where} {r['sender_name']}: {(r['content'] or '')[:80]}")
     if not rows:
-        print('这段时间没有人私聊或 @ 你')
+        print('这段时间没有人私聊、@ 你或回你')
     return 0
 
 
@@ -1614,6 +1861,94 @@ def cmd_doctor(args):
     return 1 if failed else 0
 
 
+def _plugin_flags():
+    """全局的 --memory X / --comms Y(写在子命令前后都行): 这一次运行临时切换插件, 等同于设 LARKX_MEMORY / LARKX_COMMS。
+    在 argparse 之前处理, 子命令(包括 daemon)读到的配置就是切换后的。"""
+    argv, out = sys.argv[1:], []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        key = next((k for k in ('memory', 'comms') if a == f'--{k}' or a.startswith(f'--{k}=')), None)
+        # larkx plugin use --memory X 是它自己的参数, 不在这里吃掉
+        if key and 'plugin' not in out:
+            value = a.split('=', 1)[1] if '=' in a else (argv[i + 1] if i + 1 < len(argv) else '')
+            i += 1 if '=' in a else 2
+            if not value:
+                sys.exit(f'--{key} 要写名字, 可选: {", ".join(plugins.names(key))}')
+            if value not in plugins.names(key):
+                sys.exit(f'未知的{"记忆策略" if key == "memory" else "交互协议"} {value}, 可选: {", ".join(plugins.names(key))}')
+            os.environ[plugins.ENV[key]] = value
+            continue
+        out.append(a)
+        i += 1
+    sys.argv[1:] = out
+
+
+def _env_file():
+    from .service import PROJECT_DIR
+    return PROJECT_DIR / '.env'
+
+
+def _write_env(path, values: dict):
+    """改 .env 里的这几项(已有就替换那一行, 没有就追加), 其他内容不动; 值为 None 时删掉那一行。"""
+    lines = path.read_text(encoding='utf-8').splitlines() if path.exists() else []
+    out, seen = [], set()
+    for line in lines:
+        key = line.split('=', 1)[0].strip() if '=' in line and not line.lstrip().startswith('#') else ''
+        if key in values:
+            seen.add(key)
+            if values[key] is not None:
+                out.append(f'{key}={values[key]}')
+            continue
+        out.append(line)
+    for key, value in values.items():
+        if key not in seen and value is not None:
+            out.append(f'{key}={value}')
+    path.write_text('\n'.join(out) + '\n', encoding='utf-8')
+
+
+def cmd_plugin(args):
+    """插件: 看可选的记忆策略和交互协议, 或者写进 .env 长期切换(重启 daemon 后生效)。"""
+    if args.action == 'use':
+        if not args.use_memory and not args.use_comms:
+            return _fail(args, '用法: larkx plugin use --memory <名字> [--comms <名字>]')
+        values = {}
+        for kind, value in (('memory', args.use_memory), ('comms', args.use_comms)):
+            if value and value not in plugins.names(kind):
+                return _fail(args, f'未知的{"记忆策略" if kind == "memory" else "交互协议"} {value}, 可选: {", ".join(plugins.names(kind))}')
+        if args.use_memory:
+            values['LARKX_MEMORY'] = args.use_memory
+            # 只换记忆策略时, 交互协议回到"跟着记忆策略走"
+            values['LARKX_COMMS'] = args.use_comms
+        elif args.use_comms:
+            values['LARKX_COMMS'] = args.use_comms
+        path = _env_file()
+        _write_env(path, values)
+        for key, value in values.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        cfg = load_config()
+        msg = f'已写进 {path}: {plugins.describe(cfg)}。重启 daemon 生效: larkx service restart'
+        _print_json({'ok': True, 'memory': cfg['memory'], 'comms': cfg['comms'], 'env': str(path)}) if args.json else print(msg)
+        return 0
+    cfg = load_config()
+    out = {}
+    for kind in plugins.KINDS:
+        out[kind] = [{'name': n, 'active': cfg.get(kind) == n, 'description': plugins.plugin_class(kind, n).description}
+                     for n in plugins.names(kind)]
+    if args.json:
+        _print_json(out)
+        return 0
+    for kind, title in (('memory', '记忆策略(--memory)'), ('comms', '交互协议(--comms)')):
+        print(title)
+        for item in out[kind]:
+            print(f"  {'*' if item['active'] else ' '} {item['name']:<10} {item['description']}")
+    print(f'当前: {plugins.describe(cfg)}。--comms 不写时跟着记忆策略配套的协议走。')
+    return 0
+
+
 def main():
     for stream in (sys.stdout, sys.stderr):
         try:
@@ -1622,7 +1957,10 @@ def main():
             pass
     logger.remove()
     logger.add(sys.stderr, level='INFO')
-    parser = argparse.ArgumentParser(prog='larkx', description='以本人身份操作飞书 / Lark 的 CLI, 也是数字人的工具')
+    _plugin_flags()
+    parser = argparse.ArgumentParser(prog='larkx', description='以本人身份操作飞书 / Lark 的 CLI, 也是数字人的工具',
+                                     epilog='插件: larkx --memory <记忆策略> [--comms <交互协议>] <子命令> 这一次临时切换, '
+                                            '如 larkx --memory work daemon; 长期切换用 larkx plugin use。')
     sub = parser.add_subparsers(dest='cmd', required=True)
     p = sub.add_parser('auth', help='凭证管理')
     p.add_argument('action', choices=['status', 'import', 'check', 'qr'])
@@ -1630,10 +1968,12 @@ def main():
     p.add_argument('--file', help='从文件读 cookie')
     p.add_argument('--region', choices=list(REGIONS), help='qr/import 登录的区域: feishu=飞书(国内版) lark=Lark(国际版);默认沿用已有凭证,无凭证时取 LARKX_REGION')
     p.set_defaults(fn=cmd_auth)
-    p = sub.add_parser('send', help='发送文本或 markdown 富文本消息')
+    p = sub.add_parser('send', help='发送文本、markdown 富文本消息, 或者 --file 发图片和文件')
     p.add_argument('chat_id')
     p.add_argument('text', nargs='*', help='消息内容; 省略或写 - 时从 stdin 读取')
     p.add_argument('--root', help='回复哪条消息: 普通群和私聊里是主会话里的引用回复(那条已在话题里时回进话题), 话题群里回进话题')
+    p.add_argument('--thread', action='store_true',
+                   help='和 --root 一起用: 普通群里回进以那条为根的话题(没有话题就新开一个), 不在主会话里引用回复')
     p.add_argument('-m', '--markdown', action='store_true',
                    help='按 markdown 富文本发送: 代码块(```)、有序/无序列表、标题、引用、**加粗**、*斜体*、链接; 不带此选项时按纯文本发送')
     p.add_argument('--urgent', action='store_true', help='发出后立即加急(应用内); 私聊默认加急对方, 群里要配 --urgent-to')
@@ -1644,6 +1984,15 @@ def main():
     p.set_defaults(fn=cmd_send)
     p.add_argument('--mention', action='append', default=[], metavar='USER_ID:NAME',
                    help='真实 @对象，可重复; 可以和 -m 一起用。正文里写了 "@显示名" 的就地变成 @, 没写到的放在正文最前面')
+    p.add_argument('--file', action='append', default=[], metavar='PATH',
+                   help='发送本地文件, 可重复: png/jpg/jpeg/gif/webp(不超过 10MB)按图片发, 其余按文件发; 带文字时先发文字再发文件')
+    p = sub.add_parser('doc', help='云文档: read 读正文, comment 看评论上下文, reply 在评论下回复(要装好 lark-cli 并登录)')
+    p.add_argument('action', choices=['read', 'comment', 'reply'])
+    p.add_argument('chat_id', help='云文档会话 id(doc:<feed id>, 见触发消息或 larkx chats)')
+    p.add_argument('comment_id', nargs='?', default='', help='评论 ID(触发消息里的 anchor); comment、reply 要给')
+    p.add_argument('text', nargs='*', help='回复内容(纯文本); 省略或写 - 时从 stdin 读取')
+    p.add_argument('--json', action='store_true')
+    p.set_defaults(fn=cmd_doc)
     p = sub.add_parser('forward', help='转发消息: 逐条转发到一个或几个会话, 或者 --merge 合并成一条聊天记录转发')
     p.add_argument('msg_id', nargs='+', help='要转发的消息 id(larkx messages / history 里的 msg_id), 可以写几个, 按顺序转发')
     p.add_argument('--to', action='append', required=True, metavar='CHAT_ID', help='转发到哪个会话, 可重复')
@@ -1746,7 +2095,21 @@ def main():
     p.add_argument('--keyword', action='append', default=[], help='正文关键词，任意命中，可重复')
     p.add_argument('--json', action='store_true')
     p.set_defaults(fn=cmd_rule)
-    p = sub.add_parser('mentions', help='最近谁找过你: 别人的私聊、@你的群消息, 以及你之后回没回')
+    p = sub.add_parser('ping', help='通知本人: 这件事要本人亲自处理(数字人用; 记进本人收件箱 larkx inbox)')
+    p.add_argument('text', nargs='*', help='要本人做什么, 一句话; 省略或写 - 时从 stdin 读')
+    p.add_argument('--chat', default='', help='相关会话, 默认当前这一轮的会话')
+    p.add_argument('--msg', default='', help='相关消息 id, 默认触发这一轮的消息')
+    p.add_argument('--json', action='store_true')
+    p.set_defaults(fn=cmd_ping)
+    p = sub.add_parser('inbox', help='本人收件箱: 数字人判断要你处理的事、别人 @ 你的消息')
+    p.add_argument('--since', default='24h', help='多久以内, 如 2h、1d')
+    p.add_argument('--json', action='store_true')
+    p.set_defaults(fn=cmd_inbox)
+    p = sub.add_parser('watch', help='本人在线: 实时看收件箱; 运行期间数字人对别人的消息只判断、写收件箱, 不回复不执行')
+    p.add_argument('--since', default='', help='先补看多久以内的旧条目, 如 1h; 默认只看新的')
+    p.add_argument('--json', action='store_true', help='每条一行 JSON')
+    p.set_defaults(fn=cmd_watch)
+    p = sub.add_parser('mentions', help='最近谁找过你: 别人的私聊、@你的群消息、回你消息或在你话题里的消息, 以及你之后回没回')
     p.add_argument('--since', default='24h', help='多久以内, 如 12h、1d')
     p.add_argument('--json', action='store_true')
     p.set_defaults(fn=cmd_mentions)
@@ -1819,12 +2182,20 @@ def main():
     p.add_argument('--skip-model', action='store_true', help='跳过模型调用检查')
     p.add_argument('--json', action='store_true')
     p.set_defaults(fn=cmd_doctor)
+    p = sub.add_parser('plugin', help='插件: list 看可选的记忆策略和交互协议; use --memory X [--comms Y] 写进 .env 长期切换')
+    p.add_argument('action', choices=['list', 'use'])
+    p.add_argument('--memory', dest='use_memory', help='记忆策略, 如 default / work')
+    p.add_argument('--comms', dest='use_comms', help='交互协议, 如 default / work; 不写时跟着记忆策略配套的走')
+    p.add_argument('--json', action='store_true')
+    p.set_defaults(fn=cmd_plugin)
+    # 插件自己的子命令(如 larkx memory、larkx group), 没启用时调用会提示怎么启用
+    plugins.register_cli(sub)
     # 在解析参数之前拦截, 参数写错时也不会绕过
     sub_cmd = next((a for a in sys.argv[1:] if not a.startswith('-')), None)
     if is_agent_actor() and sub_cmd in AGENT_FORBIDDEN:
         sys.exit(_fail(argparse.Namespace(json='--json' in sys.argv), f'数字人不能使用 larkx {sub_cmd}', code=3))
     args, extra = parser.parse_known_args()
-    if extra and args.cmd in ('send', 'task', 'say'):
+    if extra and args.cmd in ('send', 'doc', 'task', 'say'):
         # send 的内容可以写在选项后面, 如 send <chat> --json -
         args.text += extra
     elif extra:

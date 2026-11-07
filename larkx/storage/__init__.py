@@ -7,6 +7,9 @@ from ..config import inside_twin, load_config
 from .models import (Action, AgentSession, Base, CatchupMark, Chat, Control, InboxItem, Message, Setting, Takeover, Task,
                      WhitelistEntry)
 
+# 建表前要跑的迁移 fn(engine)(比如给旧表改名): 插件的 models 模块登记进来, 见 larkx/plugins.load_models
+MIGRATIONS = []
+
 # 触发时先回的表情: 固定用 OK(👌)
 ACK_REACTION = 'OK'
 # 先回表情的范围: owner 只对本人自己发的 /ai 消息, all 所有触发数字人的消息(包括白名单里的人)
@@ -20,7 +23,7 @@ def _json_default(o):
     return str(o)
 
 
-# create_all 只建新表不加列: 表已经存在、后来才加的列在这里补上(列名, 类型)
+# create_all 只建新表不加列: 表已经存在、后来才加的列在这里补上(列名, 类型)。插件的表在自己的 models 模块里登记
 ADDED_COLUMNS = {'chat_profiles': [('suggested_at', 'DATETIME')],
                  'chat_groups': [('feishu_label_id', "VARCHAR(32) DEFAULT ''")]}
 
@@ -57,6 +60,10 @@ class Storage:
         cfg = load_config()
         self.url = url or cfg['storage_url']
         self.engine = create_engine(self.url, pool_pre_ping=True)
+        from ..plugins import load_models
+        load_models()   # 插件的表也登记进 Base.metadata, 一起建
+        for migrate in MIGRATIONS:
+            migrate(self.engine)
         Base.metadata.create_all(self.engine)
         _add_columns(self.engine)
         # 方法返回的对象在会话关闭后还要读属性, 提交时不让它们过期
@@ -84,6 +91,31 @@ class Storage:
                 row = Message(**fields)
                 s.add(row)
             self._touch_chat(s, row, at_msg_time)
+            s.commit()
+            return True
+        except Exception:
+            s.rollback()
+            raise
+        finally:
+            s.close()
+
+    def update_edited(self, msg: dict) -> bool:
+        """已入库的消息被编辑过(同一个 msg_id 推来了不同的内容): 换成新内容, 返回 True; 没有这条或内容没变返回 False。
+        目前只有云文档评论会这样推(编辑评论推来的还是同一条消息), IM 消息的编辑不走这里。"""
+        s = self.Session()
+        try:
+            from ..event_rules import mention_ids
+            row = s.query(Message).filter_by(msg_id=str(msg['msg_id']), chat_id=str(msg['chat_id'])).first()
+            content = msg.get('content', '') or ''
+            if not row or row.content == content:
+                return False
+            data = dict(msg.get('content_data') or {}) if isinstance(msg.get('content_data'), dict) else {}
+            data['_larkx_mention_ids'] = mention_ids(msg)
+            row.content = content
+            row.content_data = json.dumps(data, ensure_ascii=False, default=_json_default)
+            if msg.get('anchor'):
+                row.anchor, row.scope = msg['anchor'], msg.get('scope', row.scope)
+            self._touch_chat(s, row)
             s.commit()
             return True
         except Exception:
@@ -454,20 +486,56 @@ class Storage:
         finally:
             s.close()
 
+    @staticmethod
+    def _own_messages(s, user_id: str):
+        """本人亲自发的消息。数字人以本人身份发的、daemon 自动回的(审计里不是 human 发的)不算,
+        不然数字人回过话的话题都会变成"找本人"。"""
+        auto = s.query(Action.msg_id).filter(Action.actor != 'human', Action.msg_id != '')
+        return s.query(Message).filter(Message.sender_id == str(user_id), Message.msg_id.notin_(auto))
+
+    def replies_to_owner(self, msg: dict, user_id: str) -> bool:
+        """这条消息在回本人: 直接回复本人发的消息, 或在本人发起、回过话的话题里。和 @ 本人一样算找本人。"""
+        s = self.Session()
+        try:
+            return self._replies_owner(s, msg, user_id)
+        finally:
+            s.close()
+
+    def _replies_owner(self, s, msg, user_id: str) -> bool:
+        """msg 是消息 dict 或 Message 行。"""
+        get = msg.get if isinstance(msg, dict) else (lambda k: getattr(msg, k, None))
+        parent, root = str(get('parent_id') or ''), str(get('root_id') or get('anchor') or '')
+        if not parent and not root:
+            return False
+        cond = [Message.msg_id.in_([x for x in (parent, root) if x])]
+        if root:
+            cond += [Message.root_id == root, Message.anchor == root]
+        own = self._own_messages(s, user_id).filter(Message.chat_id == str(get('chat_id')), or_(*cond))
+        return own.first() is not None
+
     def mentions(self, user_id: str, name: str, since_ts: int, limit=200):
-        """since_ts 之后找本人的消息: 别人发来的私聊, 以及 @ 到本人的群消息; 附带本人之后有没有在该会话回过话。"""
+        """since_ts 之后找本人的消息: 别人发来的私聊, @ 到本人的群消息, 以及在回本人的消息(见 replies_to_owner);
+        附带本人之后有没有在该会话回过话。"""
         s = self.Session()
         try:
             q = s.query(Message).filter(Message.create_time >= since_ts, Message.sender_id != str(user_id),
                                         Message.direction == 'in')
             # 群里的 @: 正文里的 @名字, 或者入库时记下的 @ 列表(_larkx_mention_ids)里有本人。
             # 先用 LIKE 粗筛, 再解析确认: content_data 里别处带着本人 id(比如合并转发的记录)不算
-            cond = [Message.chat_type == 1, Message.content_data.like(f'%"{user_id}"%')]
+            own = self._own_messages(s, user_id)
+            ids = own.with_entities(Message.msg_id)
+            roots = own.filter(Message.root_id != '').with_entities(Message.root_id)
+            anchors = own.filter(Message.anchor != '').with_entities(Message.anchor)
+            # 在回本人: 回复了本人发的消息, 或者在本人发起、回过话的话题里
+            replies = [Message.parent_id.in_(ids), Message.root_id.in_(ids), Message.root_id.in_(roots),
+                       Message.root_id.in_(anchors)]
+            cond = [Message.chat_type == 1, Message.content_data.like(f'%"{user_id}"%'), *replies]
             if name:
                 cond.append(Message.content.like(f'%@{name}%'))
             rows = []
             for r in q.filter(or_(*cond)).order_by(Message.create_time).yield_per(500):  # 分批读, 不一次读进全部候选
-                if r.chat_type == 1 or mentioned(r.content_data, r.content, user_id, name):
+                if r.chat_type == 1 or mentioned(r.content_data, r.content, user_id, name) or \
+                        self._replies_owner(s, r, user_id):
                     rows.append(r)
                     if len(rows) >= limit:
                         break
@@ -475,9 +543,10 @@ class Storage:
             for r in rows:
                 replied = s.query(Message.id).filter(Message.chat_id == r.chat_id, Message.sender_id == str(user_id),
                                                      Message.create_time >= r.create_time).first() is not None
+                kind = 'p2p' if r.chat_type == 1 else 'at' if name and f'@{name}' in (r.content or '') else 'reply'
                 out.append({'msg_id': r.msg_id, 'chat_id': r.chat_id, 'chat_name': r.chat_name, 'chat_type': r.chat_type,
                             'sender_name': r.sender_name, 'sender_id': r.sender_id, 'create_time': r.create_time,
-                            'content': r.content, 'kind': 'p2p' if r.chat_type == 1 else 'at', 'replied': replied})
+                            'content': r.content, 'kind': kind, 'replied': replied})
             return out
         finally:
             s.close()
@@ -594,6 +663,7 @@ class Storage:
             return n > 0
         finally:
             s.close()
+
 
     # ---- 网页上的设置 ----
     # 和白名单一样: daemon 每次用到时现查, 网页改了立即生效, 不用重启; 只有本人能改, 数字人的会话里调用会被拒绝

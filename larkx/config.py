@@ -15,6 +15,10 @@ DB_DEFAULT_PATH = DATA_DIR / "messages.db"
 ACTOR_ENV = "LARKX_ACTOR"
 
 DEFAULTS = {
+    # 插件(见 larkx/plugins/__init__.py、docs/plugins.md): 记忆策略和交互协议, default 是上游原样。
+    # comms 留空时跟着记忆策略配套的协议走, 所以 LARKX_MEMORY=work 一个开关就同时切到 work 协议
+    "memory": "default",
+    "comms": "",
     "region": "feishu",
     "storage_url": f"sqlite:///{DB_DEFAULT_PATH}",
     # 收到别人的消息就标为已读。默认关: 数字人收消息、翻记录都不会改变已读状态, 未读留给本人自己看
@@ -41,6 +45,10 @@ DEFAULTS = {
     "agent_model": "",
     # 主模型被安全策略拦截时 Claude Code 会整会话切到备用模型, 必须指定一个当前接入点可用的模型
     "agent_fallback_model": "",
+    # codex 后端的会话策略: single = 所有消息进同一个 thread; chat = 每个飞书会话一个 thread, 空闲超过
+    # agent_session_idle 秒开新的。留空由记忆策略决定(default 用 single, work 用 chat)
+    "agent_session": "",
+    "agent_session_idle": 7200,
     # 单轮处理超时(秒), 超时后中断这一轮
     "agent_turn_timeout": 1800,
     # 每天几点(本地时间)让数字人回顾当天的对话和消息, 整理长期记忆; 设为 -1 关闭
@@ -77,6 +85,8 @@ DEFAULTS = {
     # 本人账号用不了(如飞书登录失效)时的备用通知命令, {text} 替换成通知内容; 例:
     # lark-cli im +messages-send --as bot --user-id ou_xxx --text {text}
     "alert_cmd": "",
+    # 回复云文档评论用的 lark-cli 命令(以本人身份调开放平台, 要先 auth login); 网页版协议里没有回复评论的接口
+    "lark_cli": "lark-cli",
     # 数字人 10 分钟内最多发多少条消息, 超过后拒绝发送并告警
     "send_rate_limit": 20,
     # 重启后补处理的消息最多是多久之前的(秒), 更早的不再回复
@@ -106,6 +116,8 @@ DEFAULTS = {
         # 只有本人能唤起(默认开, 安全优先): 别人发的消息(私聊、群聊, 包括 @ 本人的)一律不触发; 接管、定时任务、larkx say 不受影响。
         # 只在唤起白名单为空时起作用; 想让别人也能唤起就加白名单, 或者设 LARKX_TRIGGER_OWNER_ONLY=false
         "owner_only": True,
+        # 云文档评论里谁都能唤起(还是要 @ 本人), 不看 owner_only 和唤起白名单; 别人发起的只回答和这篇文档有关的问题
+        "doc_anyone": False,
     },
 }
 
@@ -118,6 +130,7 @@ TRIGGER_ENV = {
     "keywords": "LARKX_TRIGGER_KEYWORDS",
     "group_at_only": "LARKX_TRIGGER_GROUP_AT_ONLY",
     "owner_only": "LARKX_TRIGGER_OWNER_ONLY",
+    "doc_anyone": "LARKX_TRIGGER_DOC_ANYONE",
 }
 
 
@@ -152,7 +165,7 @@ def load_config() -> dict:
     cfg["agent_turn_timeout"] = int(cfg["agent_turn_timeout"])
     cfg["memory_review_hour"] = int(cfg["memory_review_hour"])
     cfg["memory_flush_ratio"] = float(cfg["memory_flush_ratio"])
-    for key in ("send_rate_limit", "inbox_max_age", "catchup_interval", "takeover_default", "web_port",
+    for key in ("agent_session_idle", "send_rate_limit", "inbox_max_age", "catchup_interval", "takeover_default", "web_port",
                 "deny_reply_cooldown", "memory_consolidate_weekday",
                 "retention_archive_days", "retention_light_days", "backfill_days"):
         cfg[key] = int(cfg[key])
@@ -173,7 +186,9 @@ def load_config() -> dict:
         else:
             triggers[key] = v
     cfg["triggers"] = triggers
-    return cfg
+    # 启用的插件: 补上它们自己的配置项, 再让它们调整基础配置(如 codex 的会话策略)
+    from .plugins import apply_config
+    return apply_config(cfg)
 
 
 # 数字人不能靠自己带环境变量打开的配置: 数字人进程里以 daemon 写进 turn.json 的值为准
@@ -256,4 +271,10 @@ def inside_twin(proc: str = "/proc") -> bool:
 def with_signature(text: str, cfg: dict) -> str:
     """数字人发出的消息加上签名: 空一行再署名, 一眼能看出是后缀而不是正文的最后一句。"""
     sig = (cfg.get("reply_signature") or "").strip()
-    return f"{text.rstrip()}\n\n—— {sig}" if sig else text
+    if not sig:
+        return text
+    body = text.rstrip()
+    # 模型照着历史消息自己写了签名(或者同一段文字被签过一次)就不再加, 免得出现两行签名
+    while body.endswith(sig):
+        body = body[:-len(sig)].rstrip().removesuffix("——").rstrip()
+    return f"{body}\n\n—— {sig}"

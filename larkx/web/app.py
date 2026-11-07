@@ -176,8 +176,11 @@ def overview(request: Request):
         messages_today = s.query(Message).filter(Message.create_time >= today.timestamp()).count()
     finally:
         s.close()
-    key = 'main:codex' if cfg['agent_backend'] == 'codex' else 'main'
-    sess = st.session_get(key)
+    if cfg['agent_backend'] == 'codex' and (cfg.get('agent_session') or 'chat') != 'single':
+        # 按会话分 thread: 显示最近活跃的那个
+        sess = next((r for r in st.list_sessions(limit=50) if r.session_key.startswith('codex:') and r.agent_session_id), None)
+    else:
+        sess = st.session_get('main:codex' if cfg['agent_backend'] == 'codex' else 'main')
     turn = state.read_turn()
     home = Path(cfg['agent_home'])
     memory_files = sorted(p.name for p in (home / 'memory').glob('*.md'))

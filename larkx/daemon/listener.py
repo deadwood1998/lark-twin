@@ -5,6 +5,7 @@ from loguru import logger
 
 from .. import state
 from ..protocol import AuthExpired
+from ..protocol.proto import decoders
 
 
 class Listener:
@@ -35,11 +36,18 @@ class Listener:
         chat_id = msg['chat_id']
         chat_type = msg.get('chat_type', 0)
         is_own = str(msg['from_id']) == self.my_user_id
+        is_doc = decoders.is_doc_chat(chat_id)
         sender_key = (msg['from_id'], chat_id)
         if sender_key not in cache:
-            cache[sender_key] = await asyncio.to_thread(client.get_user_name, msg['from_id'], chat_id)
+            # 云文档通知不在 IM 会话里, 按不带会话(chat_id 0)查名字
+            cache[sender_key] = await asyncio.to_thread(client.get_user_name, msg['from_id'], '0' if is_doc else chat_id)
         sender_name = cache.get(sender_key) or ''
-        if chat_id not in cache:
+        if is_doc:
+            # 文档标题跟着通知推来, 改了标题下一条就更新
+            if msg.get('chat_name') and cache.get(chat_id) != msg['chat_name']:
+                cache[chat_id] = msg['chat_name']
+                st.update_chat_name(chat_id, msg['chat_name'], chat_type)
+        elif chat_id not in cache:
             if chat_type in (2, 3):
                 cache[chat_id] = await asyncio.to_thread(client.get_group_name, chat_id)
                 if cache[chat_id]:
@@ -50,6 +58,11 @@ class Listener:
         chat_name = cache.get(chat_id) or ''
         saved = st.save_message(msg, sender_name=sender_name, chat_name=chat_name,
                                 direction='out' if is_own else 'in')
+        if not saved and is_doc and st.update_edited(msg):
+            # 编辑过的评论推来的还是同一条消息(比如先发了 /ai 才补上 @本人): 按新内容再判断一次;
+            # 改之前那版已经交给数字人的, 收件箱按 msg_id 去重, 不会再处理一次
+            logger.info(f'云文档评论 {msg["msg_id"]} 被编辑过, 按新内容重新判断')
+            saved = True
         if not saved:
             return False
         content = msg['content'] or ''

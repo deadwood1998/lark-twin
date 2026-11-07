@@ -1,18 +1,22 @@
 import hashlib
 import json
-import shutil
 import subprocess
 from pathlib import Path
 
 from loguru import logger
 
+from .. import plugins
+
 TEMPLATES = Path(__file__).parent / 'templates'
 # 历次发布的人设模板。数字人目录里的 CLAUDE.md 和其中某一版完全相同(用户没改过)时, 自动升级到当前模板
 OLD_TEMPLATE_SHA256 = {'6927812ddbec998de7f1785c415889ed74adb266f83768a6a5647216dad11bca',
+                       '3b3a64fe8303a2113a3e00f29583653354def072076e55e45a1d4d730d8beb88',
                        'de2a5b963785a90cbcd3e8e3ae5a0f627804a044352d36d5d8eed506a97337a6',
                        '3e39cab454487972a823ba89b2b290b2019ee01882bf6edab2d46bcc632519a0',
                        '23f7839130d2f6ada2e12fe75d3b57a5ac4688d313bccde0ee0b05526524f01c',
-                       '37d1677e0b79a5b53a2efb1148a645e91c413dffec5dda17ae36352f13780a0d'}
+                       '37d1677e0b79a5b53a2efb1148a645e91c413dffec5dda17ae36352f13780a0d',
+                       # 工作记忆和交互约定写死在模板里的那一版; 现在它们由插件写进 CLAUDE.md 末尾的插件区块
+                       '21ede3015d733a55a12914fd78c5da8d32864bbe10686851270da59e36458c43'}
 GITIGNORE = 'downloads/\nrepos/\n'
 MEMORY_INDEX = '# 记忆索引\n\n每行一条: - [标题](文件名.md) — 一句话说明。具体内容写在对应文件里。\n'
 
@@ -46,13 +50,21 @@ def ensure_agent_home(cfg: dict) -> Path:
     (home / 'downloads').mkdir(exist_ok=True)
     # 数字人自己克隆的代码仓库放这里, 不进数字人目录的 git
     (home / 'repos').mkdir(exist_ok=True)
-    # 人设和行为准则归用户所有, 只在首次创建; 用户没改过的旧版模板自动升级
+    # 人设和行为准则归用户所有, 只在首次创建; 用户没改过的旧版模板自动升级。
+    # 启用的插件(记忆策略、交互协议)各自的说明写在末尾的插件区块里, 每次启动按当前插件重写, 区块外不动
+    memory_plugin, comms_plugin = plugins.load(cfg)
     claude_md = home / 'CLAUDE.md'
+    template = (TEMPLATES / 'CLAUDE.md').read_text(encoding='utf-8')
     if not claude_md.exists():
-        shutil.copyfile(TEMPLATES / 'CLAUDE.md', claude_md)
-    elif hashlib.sha256(claude_md.read_bytes()).hexdigest() in OLD_TEMPLATE_SHA256:
-        shutil.copyfile(TEMPLATES / 'CLAUDE.md', claude_md)
-        logger.info('CLAUDE.md 是未修改过的旧版模板, 已升级到当前模板')
+        text = template
+    else:
+        text = claude_md.read_text(encoding='utf-8')
+        if hashlib.sha256(plugins.strip_persona_block(text).encode('utf-8')).hexdigest() in OLD_TEMPLATE_SHA256:
+            text = template
+            logger.info('CLAUDE.md 是未修改过的旧版模板, 已升级到当前模板')
+    text = plugins.with_persona_block(text, plugins.persona_block(memory_plugin, comms_plugin))
+    if not claude_md.exists() or claude_md.read_text(encoding='utf-8') != text:
+        claude_md.write_text(text, encoding='utf-8')
     # Codex 读 AGENTS.md: 指向同一份人设
     agents_md = home / 'AGENTS.md'
     if not agents_md.exists() and not agents_md.is_symlink():
@@ -61,6 +73,7 @@ def ensure_agent_home(cfg: dict) -> Path:
     memory.mkdir(exist_ok=True)
     if not (memory / 'MEMORY.md').exists():
         (memory / 'MEMORY.md').write_text(MEMORY_INDEX, encoding='utf-8')
+    memory_plugin.ensure_home(home)   # 记忆策略自己的目录和规则
     # 会话记录默认 30 天清理, 常驻会话要长期保留。写在项目配置里而不是 --settings 参数,
     # 因为 ccd 这类启动器自己也会传 --settings, 两个参数会互相覆盖
     settings = home / '.claude' / 'settings.json'
@@ -69,10 +82,11 @@ def ensure_agent_home(cfg: dict) -> Path:
     if data.get('cleanupPeriodDays') != 3650:
         data['cleanupPeriodDays'] = 3650
         settings.write_text(json.dumps(data, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
-    # skill 是 larkx CLI 的使用手册, 跟着代码版本走, 每次启动都同步
+    # skill 是 larkx CLI 的使用手册, 跟着代码版本走, 每次启动都同步; 启用的插件的命令说明接在后面
     skill_dir = home / '.claude' / 'skills' / 'larkx'
     skill_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(TEMPLATES / 'skills' / 'larkx' / 'SKILL.md', skill_dir / 'SKILL.md')
+    base_skill = (TEMPLATES / 'skills' / 'larkx' / 'SKILL.md').read_text(encoding='utf-8')
+    (skill_dir / 'SKILL.md').write_text(plugins.skill_text(base_skill, memory_plugin, comms_plugin), encoding='utf-8')
     commit_agent_home(home, '启动时同步数字人目录')
     return home
 

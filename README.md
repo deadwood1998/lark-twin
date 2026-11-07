@@ -46,9 +46,11 @@ cp .env.example .env          # 选择 claude / codex，并填写启动命令
 | `/ai /takeover 2h 目标` · `/ai /release` | 接管 · 结束接管当前会话。接管期间对方说的话都由它回复 |
 | `/ai /stop` · `/ai /clear` | 打断当前任务 · 开启新会话，长期记忆保留 |
 
+**在云文档评论里**：有人在评论里 @你，或者评论、回复你的文档时，数字人也收得到（飞书推来的文档通知，不是 IM 消息）。评论里带 `/ai` 时按上面同样的规则触发：别人要 @你，你自己评论不用 @ 自己，白名单和 `LARKX_TRIGGER_OWNER_ONLY` 一样生效，没权限时在评论下回那句 `LARKX_DENY_REPLY`。想让评论里谁都能叫它，打开 `LARKX_TRIGGER_DOC_ANYONE`：不看白名单和只有本人能唤起，但别人发起的只回答和这篇文档有关的问题，能用的命令也只剩读这篇文档、看和回复那条评论（`larkx doc read` / `comment` / `reply`）。你自己的评论飞书不推送，叫不起来。数字人在这条评论下回复（`larkx doc reply`），只发纯文本。回复评论走官方开放平台，需要本机装好 [lark-cli](https://github.com/larksuite/cli) 并以用户身份登录（`LARKX_LARK_CLI`）。评论里不能接管，补收也补不回漏推的文档通知。
+
 以 `/` 开头的命令只认你本人。默认数字人只听你一个人的（`LARKX_TRIGGER_OWNER_ONLY` 默认 `true`，安全优先）：别人发的 `/ai`（私聊、群聊，包括 @你 的）都不理会；你主动接管的会话、定时任务、`larkx say` 照常。想放行少数几个人，用下面的唤起白名单；想让所有人都能唤起，在 `.env` 设 `LARKX_TRIGGER_OWNER_ONLY=false`。
 
-**谁能唤起它（唤起白名单）**：你自己一直能。白名单里有人时，只有你和白名单里的人能唤起，别人的 `/ai` 一律不理；白名单为空时按上面的 `LARKX_TRIGGER_OWNER_ONLY`。群里照旧要 @你。白名单里的人和其他人一样按访客对待，不会拿到你的权限。在控制台的"白名单"页搜名字添加（同名的看头像和部门区分），或者用 `larkx whitelist add <名字或 user_id>`，两边是同一份名单，改了立即生效，不用重启。数字人自己改不了白名单：它调用 `larkx whitelist add/remove` 会被拒绝并通知你。
+**谁能唤起它（唤起白名单）**：你自己一直能。白名单里有人时，只有你和白名单里的人能唤起，别人的 `/ai` 一律不理；白名单为空时按上面的 `LARKX_TRIGGER_OWNER_ONLY`。群里照旧要 @你。白名单里的人和其他人一样按访客对待，不会拿到你的权限。在控制台的"白名单"页搜名字添加（同名的看头像和部门区分），或者用 `larkx whitelist add <名字或 user_id>`，两边是同一份名单，改了立即生效，不用重启。数字人自己改不了白名单：它调用 `larkx whitelist add/remove` 会被拒绝并通知你。（启用交互协议 `work` 时，白名单里的人和你的私聊还会自动旁听，见下面的[插件](#插件记忆策略和交互协议)。）
 
 **没权限的人想唤起时**：私聊里发 `/ai …`、或者在群里 @你 发 `/ai …` 的人没有权限时，daemon 马上引用回复他一句 `LARKX_DENY_REPLY`（默认"你没有权限唤起{owner}的 lark-twin"，`{owner}` 换成你的名字），不经过数字人、不加签名。同一会话里同一个人 10 分钟内只回一次（`LARKX_DENY_REPLY_COOLDOWN`，秒）。群里没 @你 的 `/ai`、普通聊天、机器人发的都不回；接管中的会话照常交给数字人。`LARKX_DENY_REPLY` 设成空就关掉。每次回复都记进审计（`larkx audit`、控制台"动态"页）。
 
@@ -57,6 +59,8 @@ cp .env.example .env          # 选择 claude / codex，并填写启动命令
 ```bash
 larkx send <chat_id> - <<'EOF'   # 以你的身份发消息
 larkx send <chat_id> -m -        # 发 markdown 富文本：代码块、列表、标题、引用、加粗/斜体、链接
+larkx send <chat_id> --file a.png --file b.pdf   # 发图片(png/jpg/gif/webp ≤10MB)和文件；带正文时先发正文
+larkx send <chat_id> --root <msg_id> --thread -  # 回进以那条为根的话题（普通群默认是引用回复）
 larkx say --wait "…"             # 直接指挥数字人
 larkx task add --in 30m -        # 安排定时任务
 larkx takeover start <chat_id> --for 2h --goal "…"   # 让它替你聊一段
@@ -74,6 +78,8 @@ larkx recall <msg_id>            # 撤回一条
 larkx urgent <msg_id> [--to 名字]  # 加急本人发的一条(默认应用内; 私聊默认对方); urgent status <msg_id> 看谁确认了
 larkx service status | logs -f   # 运行状态
 ```
+
+数字人发消息默认用纯文本，只在确实需要排版时才用 `-m`；回复别人时第一行写「名字：」点明对象（纯文字，不真的 @），在你自己的私聊里回你时不写。它用 `--file` 发文件时不能发凭证和密钥（`~/.larkx` 里除 `agent/downloads/` 以外的文件、`.env*`、`~/.ssh`、Codex/Claude 登录文件，软链接也按真实路径查），访客发起的一轮里只能发 `~/.larkx/agent/downloads/` 里的文件；被拦下的会记进审计并通知你。你自己在终端用不受限制。
 
 **在浏览器里**
 
@@ -110,6 +116,87 @@ larkx rule delete 1
 
 真实 @发送复用现有协议能力：`larkx send CHAT_ID --mention USER_ID:显示名 --json -`，正文从 stdin 读取。`--mention` 可以重复，也可以和 `-m/--markdown` 一起用；正文里写了 `@显示名`（与某个 `--mention` 的显示名一致）的地方就地变成真实 @（代码块里的除外），没写到的放在正文最前面。
 
+## 本人在线：收件箱和 larkx watch
+
+- 收件箱 `~/.larkx/state/owner_inbox.jsonl` 只由数字人写：它看过消息、判断要你亲自处理时运行 `larkx ping "<要你做什么>"`。`larkx inbox --since 2h` 查看。
+- `larkx watch`：实时打印收件箱新增的条目。运行期间你算"在线"：
+  - 别人私聊你、@ 你、没权限想唤起的消息，平时数字人不处理（或只回"没有权限"），在线时都交给数字人看一眼；
+  - 别人发起的每一轮数字人只判断、要你处理就 ping，不回复、不执行任务（代码层面也拦着：这一轮只能用 `larkx messages/history/ping`）；
+  - Ctrl+C 退出后恢复正常；排队中只因在线才交给它的消息不再处理。本人自己发起的指令不受影响。
+- 回复进话题：`larkx send <chat_id> --root <msg_id> --thread`。在普通群里，这会回进以那条消息为根的话题（还没有话题就新开一个），而不是在主会话里引用回复。
+
+## 插件：记忆策略和交互协议
+
+默认（`default` / `default`）就是上游 lark-twin 原样的行为。另外两类能力做成了插件，一个开关切换：
+
+- **记忆策略**（`larkx/plugins/memory/`）：数字人怎么记、怎么接上前情。
+- **交互协议**（`larkx/plugins/comms/`）：哪些消息交给数字人、回复要遵守什么格式。
+
+`--memory` 会把交互协议一起切到这个记忆策略配套的那个，`--comms` 可以单独覆盖：
+
+```bash
+larkx plugin list                       # 有哪些插件、现在用的哪个
+larkx plugin use --memory work          # 长期切换(写进 .env): 记忆策略 work + 交互协议 work
+larkx plugin use --memory work --comms default   # 只要工作记忆, 不要旁听
+larkx plugin use --memory default       # 回到上游原样
+larkx --memory work daemon              # 只这一次临时指定
+```
+
+切换后重启 daemon。人设 `CLAUDE.md` 和数字人的 skill 里，插件相关的说明放在一个单独的区块里，切换时自动加上或去掉，区块外你自己的改动不受影响。插件的表在库里一直都建，切回默认也不会丢数据。
+
+以下能力不属于插件，任何组合下都有：富文本发送、云文档评论监听和回复（`larkx doc`）、`send --file` / `--thread`、`larkx watch` / `inbox` / `ping`。
+
+想加新的记忆策略或交互协议，见 [docs/plugins.md](docs/plugins.md)。
+
+### 交互协议 work：旁听、开发模式、点名回复
+
+回复第一行先点名收件人（「张三：」，纯文字不真 @）；唤起白名单里的人和你的私聊自动旁听。想让数字人在某个群里不用 @、不用 `/ai` 也能按需回复（比如联调群），或者让群里别人也能叫它查代码、改代码，就给这个群单独做配置：
+
+```bash
+larkx group set <chat_id或群名> --listen on \
+  --workdir ~/code/xxx --instruction '按联调互报协议回复，一事一话题'   # 旁听 + 专属指令 + 代码目录
+larkx group set <chat_id> --dev on          # 开发模式：别人发起的一轮也能查代码、跑命令、改代码
+larkx group set <chat_id> --bots on         # 旁听时机器人发的也处理（默认不处理）
+larkx group set <chat_id> --max-turns 10    # 旁听每 10 分钟最多交给数字人几条（默认 20，0 不限）
+larkx group set <chat_id> --allow 张三 --allow 李四   # 会话白名单：只旁听这几个人（--disallow 移出，--allow-all 清空）
+larkx group set 张三 --listen on                      # 私聊也一样，写对方名字或私聊的 chat_id
+larkx group set p2p --listen on --allow 张三 --allow 李四  # 所有私聊：这几个人私聊你时自动处理
+larkx group list | show <chat_id> | remove <chat_id>
+```
+
+- **私聊**：单个私聊和群一样配置。`p2p`（也可以写“私聊”）是所有私聊共用的一份配置，某个私聊有自己的配置时，以它自己的为准。所有私聊开旁听时，建议配合白名单使用。
+- **会话白名单**：名单非空时，只旁听名单里的人，开发模式也只对他们生效；其他人按默认规则处理（要 @、要前缀，按访客对待）。名字先在本地消息里找，找不到再在线搜；同名时要求改用 user_id。
+
+- **旁听**：别人在这个群里发的每条消息都会交给数字人，由它自己判断要不要回，不需要回就不发。以下几种不交给它：本人自己发的（包括数字人以本人身份发的，所以不会自己触发自己）、系统消息、机器人发的（`--bots on` 可以打开）。在旁听的群里，没权限的人发 `/ai` 不会收到“没有权限”的自动回复。每个群 10 分钟内超过 `--max-turns` 条就跳过并告警，防止刷屏，也防止和别的机器人互相回复。
+- **开发模式**：这个群里别人发起的每一轮（包括旁听到的、`@你 /ai` 的）都不按访客收窄，可以查代码、跑命令、改代码，但仍然只能在本会话里发消息。**只给信得过的群开。**
+- 专属指令和代码目录会附在这个群的每一轮提示词里。改完立即生效，不用重启；排队中的消息按处理那一刻的配置来（关了旁听就不再处理）。
+- 只有本人能改：数字人调用 `larkx group set/remove` 会被拒绝，并通知你。
+
+### 记忆策略 work：三层工作记忆
+
+数字人每小时开一个新会话，把你**没开免打扰**的会话里新增的消息消化成三层工作记忆（`~/.larkx/agent/memory/work/`），只记工作，不记闲聊和隐私：
+
+- **第一层 `OVERVIEW.md`**：总览（进行中的项目、任务、最近活跃的人，各一行，链接到第二层）+ 近 24 小时的零碎细节 + 待跟进，最多 6000 字。新会话先读它。
+- **第二层 `projects/` `tasks/` `people/`**：项目里谁在做什么、在哪个分支、完成没有；任务的负责人、仓库和分支、完成情况；每个人最近在哪些项目的哪个分支做什么。
+- **第三层 `archive/<年-W周>/`**：按周归档的历史，非必要不读。
+
+新增和更新由数字人做；时间规则由 larkx 用代码执行：
+- 短期记忆超过 24 小时删掉；
+- 第二层的近况超过 7 天移进归档；
+- 完成超过 2 天，或 7 天没动静（默认已经做完）的项目、任务、人，整个移进归档，并修好引用。
+
+免打扰状态取自飞书会话设置，每次消化前现查。消息本来就都存在本地库里，不另存。
+
+codex 后端也不再把所有消息塞进同一个越来越大的会话：每个飞书会话一个 thread，隔 2 小时以上再聊就开新会话，从记忆文件接上前情。
+
+```bash
+larkx work-memory                       # 状态：总览字数、各维度个数、消化到哪了、最近 1 小时消化/跳过了几个会话
+larkx work-memory feed --since 2h       # 看某段时间会被消化的增量（只含没开免打扰的会话）
+larkx work-memory archive --dry-run     # 预演归档规则；去掉 --dry-run 立即执行
+```
+
+设计细节见 [larkx/plugins/memory/work/README.md](larkx/plugins/memory/work/README.md)。
+
 ## 配套 skill
 
 `skills/` 下有三个：`lark-twin`（在本仓库里部署运维）、`larkx`（装进你的 Claude Code / Codex，用来操作飞书）、`larkx-agent`（数字人自己用的 CLI 手册）。说明见 [skills/README.md](skills/README.md)。
@@ -122,6 +209,10 @@ larkx rule delete 1
 |---|---|
 | `LARKX_AGENT_BACKEND` | `claude` 或 `codex` |
 | `LARKX_CLAUDE_CLI` / `LARKX_CODEX_CLI` | 你平时启动 agent 的命令，比如 `claude`、`ccd`、`codex`，认证沿用你自己的配置 |
+| `LARKX_MEMORY` / `LARKX_COMMS` | 记忆策略 / 交互协议，默认 `default`（上游原样），可选 `work`；`LARKX_COMMS` 不写时跟着记忆策略走。也可以用 `larkx plugin use` 改 |
+| `LARKX_AGENT_SESSION` / `LARKX_AGENT_SESSION_IDLE` | codex 后端的会话策略：`single`（所有消息一个 thread）或 `chat`（每个会话一个 thread，空闲超过这么多秒开新的，默认 7200）。不写时由记忆策略决定：`default` 用 `single`，`work` 用 `chat` |
+| `LARKX_MEMORY_DIGEST_INTERVAL` | （记忆策略 work）工作记忆每隔多少秒消化一次增量，默认 3600，0 关闭 |
+| `LARKX_MEMORY_SESSIONS` | （记忆策略 work）消化时也读本人自己的 Codex / Claude Code 会话里新增的部分（只取输入和最终输出），默认开，`false` 关闭 |
 | `LARKX_AGENT_FALLBACK_MODEL` | 用 Claude 时，主模型被安全策略拦截后改用的备用模型 |
 | `LARKX_TRIGGER_PREFIX` | 触发前缀，默认是 `/ai` |
 | `LARKX_REPLY_SIGNATURE` | 每条回复末尾的署名，比如 `🤖 lark-twin · 数字分身`，会和正文空一行、前面加"——" |

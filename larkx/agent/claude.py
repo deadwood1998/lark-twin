@@ -134,7 +134,8 @@ class ClaudeSession:
             logger.debug(f'丢弃残留消息: {type(m).__name__}')
         return crashed
 
-    async def ask(self, prompt: str) -> TurnResult:
+    async def ask(self, prompt: str, **options) -> TurnResult:
+        # options(key / note / sandbox_dir)是记忆策略给 codex 后端按会话分 thread 用的; Claude 后端是常驻的单一会话, 不区分
         async with self._lock:
             if self._client is None or self._drain_stale():
                 await self._recover()

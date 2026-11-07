@@ -3,7 +3,7 @@
 本人自己的对话、本人在群里发起的 /ai 不受这里限制。两处使用:
 - Claude 后端的工具调用检查(agent/hooks.py): 只许单条 larkx 命令, 只能读写数字人自己的目录, 不能联网、不能开子 agent;
 - larkx CLI(cli.py): 不能列会话、搜人、查"谁找过我", 不能看别的会话, 不能动接管; 转发只能把当前会话里的消息
-  转到当前会话(要转的消息在哪个会话, 由 cmd_forward 查过服务端再拦)。
+  转到当前会话(要转的消息在哪个会话, 由 cmd_forward 查过服务端再拦); send --file 只能发数字人 downloads/ 里的文件。
 按字符串匹配可以被刻意绕过, 这是减少误用和注入的防线, 不是安全隔离。
 """
 import os
@@ -11,9 +11,12 @@ import re
 import shlex
 
 from . import state
+from .protocol.proto.decoders import is_doc_chat
 
 # 访客发起的这一轮里允许用的 larkx 子命令; 其余一律拒绝。urgent(加急)故意不在里面: 加急会把别人叫起来, 只能本人发起
-GUEST_CLI_ALLOWED = {'send', 'forward', 'recall', 'task', 'messages', 'history', 'download'}
+GUEST_CLI_ALLOWED = {'send', 'doc', 'forward', 'recall', 'task', 'messages', 'history', 'download', 'ping'}
+# 本人在线(larkx watch)时别人发起的这一轮: 只能看当前会话、通知本人
+WATCH_CLI_ALLOWED = {'messages', 'history', 'ping'}
 # 访客这一轮里完全禁止的工具: 联网、开子 agent
 GUEST_BLOCKED_TOOLS = {'WebFetch', 'WebSearch', 'Task', 'Agent'}
 READ_TOOLS = {'Read', 'Glob', 'Grep', 'LS'}
@@ -90,15 +93,77 @@ def tool_denied(tool: str, tool_input: dict, agent_home: str) -> str:
     return ''
 
 
+def _secret_reason(path: str, cfg: dict) -> str:
+    """path 是不是登录凭证、密钥这类文件; 是时返回原因。只看路径本身, 符号链接由调用方解析后再查一遍。"""
+    home = os.path.expanduser('~')
+    parts = path.split(os.sep)
+    if any(p.startswith('.env') for p in parts):
+        return '.env 配置文件'
+    downloads = [os.path.join(cfg.get('agent_home') or '', 'downloads')]
+    from .config import DATA_DIR
+    for root in {str(DATA_DIR), os.path.join(home, '.larkx')}:
+        downloads.append(os.path.join(root, 'agent', 'downloads'))
+        if _inside(path, root) and not any(_inside(path, d) for d in downloads if d.strip(os.sep)):
+            return 'larkx 数据目录(登录凭证、消息库、配置)'
+    if _inside(path, os.path.join(home, '.ssh')):
+        return 'SSH 密钥目录'
+    name = os.path.basename(path)
+    for d in (os.path.join(home, '.codex'), cfg.get('agent_codex_dir') or ''):
+        if d and name == 'auth.json' and _inside(path, d):
+            return 'codex 登录凭证'
+    if name.startswith('.claude') and _inside(os.path.dirname(path), home):
+        return 'Claude 配置和登录凭证'
+    for d in (os.path.join(home, '.claude'), cfg.get('agent_claude_dir') or ''):
+        if d and _inside(path, d) and ('credential' in name.lower() or name.endswith('.json')):
+            return 'Claude 登录凭证'
+    if 'credentials' in name.lower() or name == 'web_token':
+        return '登录凭证'
+    return ''
+
+
+def send_file_denied(path: str, cfg: dict, turn) -> str:
+    """数字人用 larkx send --file 发这个文件是否越权; 越权时返回原因。
+    任何一轮都不能发凭证和密钥(按原路径和解析符号链接后的真实路径各查一遍); 访客这一轮只能发数字人 downloads/ 里的文件。"""
+    raw = os.path.abspath(os.path.expanduser(path))
+    real = os.path.realpath(raw)
+    for p in dict.fromkeys((raw, real)):
+        reason = _secret_reason(p, cfg)
+        if reason:
+            return f'数字人不能发送{reason}里的文件: {path}'
+    if is_guest(turn):
+        downloads = os.path.join(cfg.get('agent_home') or '', 'downloads')
+        if not _inside(real, downloads):
+            return f'访客发起的请求只能发送数字人 downloads 目录({downloads})里的文件'
+    return ''
+
+
 def cli_denied(cmd: str, args, turn, storage=None) -> str:
     """访客这一轮里调用 larkx 子命令是否放行; 拒绝时返回原因。"""
+    if turn.get('watch') and cmd not in WATCH_CLI_ALLOWED:
+        return f'本人在线(larkx watch), 这一轮只判断要不要本人处理, 不能使用 larkx {cmd}; 需要本人处理就 larkx ping'
     if cmd not in GUEST_CLI_ALLOWED:
         return f'访客发起的请求不能使用 larkx {cmd}'
     current = turn.get('chat_id') or ''
+    if is_doc_chat(current) or cmd == 'doc':
+        # 云文档评论谁都能叫(LARKX_TRIGGER_DOC_ANYONE), 范围最窄: 只能读这篇文档、看和回复触发这一轮的那条评论
+        if cmd != 'doc':
+            return '云文档评论里的请求只能读这篇文档、回复这条评论'
+        if str(getattr(args, 'chat_id', '')) != current:
+            return '访客发起的请求只能读、回复当前这篇文档'
+        if getattr(args, 'action', '') in ('comment', 'reply') and str(getattr(args, 'comment_id', '')) != turn.get('anchor'):
+            return '访客发起的请求只能看、回复触发这一轮的那条评论'
+        return ''
     if cmd in ('messages', 'history') and str(getattr(args, 'chat_id', '')) != current:
         return '访客发起的请求只能查看当前会话的记录'
     if cmd == 'forward' and any(str(t) != current for t in getattr(args, 'to', None) or []):
         return '访客发起的请求只能转发到当前会话'
+    if cmd == 'send' and getattr(args, 'file', None):
+        from .config import load_config
+        cfg = load_config()
+        for path in args.file:
+            denied = send_file_denied(path, cfg, turn)
+            if denied:
+                return denied
     if cmd == 'download':
         chat = getattr(args, 'chat', None)
         if not chat and storage is not None:

@@ -1,6 +1,7 @@
 import gzip
 import json
 import zlib
+from urllib.parse import parse_qs
 from protobuf_to_dict import protobuf_to_dict
 from . import proto_pb2 as P
 from .gateway import _lark_all
@@ -428,6 +429,65 @@ def batch_copy_messages(payload: bytes) -> tuple:
     if last is None or (ids and last.id not in ids):
         return ids, []
     return ids or [last.id], [message_dict(protobuf_to_dict(last))]
+
+
+# 云文档通知(docs.PushDocFeedRequest, cmd 14004): 文档里 @本人、评论本人的文档、回复本人参与的评论时推来, 不是 IM 消息。
+# 每篇文档是一个 feed, 入库时当成一个虚拟会话: chat_id 是 "doc:<feed id>", chat_type 用 IM 里没有的 DOC_CHAT_TYPE
+DOC_CHAT_TYPE = 101
+DOC_CHAT_PREFIX = 'doc:'
+# DocMessage.Type 里当成消息的: 正文里 @、评论、回复; 解决评论、表情回应、撤回这些只是状态变化, 不入库
+DOC_MSG_TYPES = {1: 'DOC_MENTION', 2: 'DOC_COMMENT', 3: 'DOC_REPLY'}
+# PushDocFeedRequest.Status: NEW / UPDATE / CREATE 带着新动静; DELETE、READ(本人在别的端看过了)不用管
+DOC_FEED_LIVE = (1, 2, 5)
+
+
+def is_doc_chat(chat_id) -> bool:
+    return str(chat_id or '').startswith(DOC_CHAT_PREFIX)
+
+
+def doc_feed_push(payload: bytes) -> tuple:
+    """云文档通知推送: 返回 (feed, {消息 id: 消息}), 都是解成 dict 的; 不用处理的状态返回 (None, {})。
+    推送里可能不带消息本身, 只有 feed 的 lastMessageId, 那样由 LarkClient 按 feed id 只读地拉回来。"""
+    p = _lark_all().docs.PushDocFeedRequest()
+    p.ParseFromString(payload)
+    if p.status not in DOC_FEED_LIVE or not p.docFeed.id:
+        return None, {}
+    return protobuf_to_dict(p.docFeed), {k: protobuf_to_dict(v) for k, v in p.docMessages.items()}
+
+
+def doc_feed_summary(payload: bytes) -> str:
+    """云文档通知推送的一行摘要(只用于日志): 状态、哪篇文档、最新消息, 推送里带着的消息是谁发的什么类型。"""
+    p = _lark_all().docs.PushDocFeedRequest()
+    p.ParseFromString(payload)
+    status = p.DESCRIPTOR.fields_by_name['status'].enum_type.values_by_number.get(p.status)
+    msgs = ', '.join(f'{k}({DOC_MSG_TYPES.get(v.type, v.type)} from {v.fromId})' for k, v in p.docMessages.items()) or '无'
+    return (f'{status.name if status else p.status} feed {p.docFeed.id}「{p.docFeed.title}」 lastMessageId {p.docFeed.lastMessageId or "无"}, '
+            f'带着的消息: {msgs}')
+
+
+def doc_feed_messages(feed: dict, messages: dict) -> list:
+    """一篇文档的 feed 和它的通知消息转成入库、判断触发用的消息, 字段和 IM 消息一样, 按时间排好。
+
+    评论 ID 不在消息里, 在 feed 的链接上(?preview_comment_id=), 指的是 feed 最新的那条(lastMessageId); 实测用它能直接回复。
+    anchor 放评论 ID(一条评论和它下面的回复就像一个话题), 别的消息拿不到评论 ID, anchor 留空, 只入库不触发。
+    content_data 里的 richText 和 IM 消息的结构一样, 判断 @ 了谁可以直接用。"""
+    url, _, query = (feed.get('url') or '').partition('?')
+    comment_id = (parse_qs(query).get('preview_comment_id') or [''])[0]
+    last = str(feed.get('lastMessageId') or '')
+    doc = {'feed_id': str(feed.get('id') or ''), 'token': feed.get('token') or '', 'title': feed.get('title') or '', 'url': url}
+    out = []
+    for v in messages.values():
+        t = enum_to_int(v.get('type', 0))
+        if t not in DOC_MSG_TYPES or not v.get('fromId'):
+            continue
+        anchor = comment_id if str(v.get('id')) == last else ''
+        out.append({'msg_id': str(v.get('id')), 'msg_type': t, 'msg_type_name': DOC_MSG_TYPES[t], 'from_id': v.get('fromId'),
+                    'from_type': 0, 'chat_id': DOC_CHAT_PREFIX + doc['feed_id'], 'chat_type': DOC_CHAT_TYPE,
+                    'chat_type_name': 'DOC', 'chat_name': doc['title'], 'scope': 'topic' if anchor else 'chat',
+                    'anchor': anchor, 'at_me': bool(v.get('isAtMe')), 'root_id': anchor, 'parent_id': '', 'cid': '',
+                    'position': 0, 'create_time': v.get('createTime'), 'content': v.get('content') or '',
+                    'content_data': {'richText': v.get('richText') or {}, 'doc': dict(doc, comment_id=anchor)}})
+    return sorted(out, key=lambda m: int(m.get('create_time') or 0))
 
 
 def frame_diag(raw: bytes) -> str:

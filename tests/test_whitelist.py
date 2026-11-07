@@ -95,7 +95,7 @@ def test_whitelisted_people_stay_guests():
     turn = {'kind': 'message', 'chat_id': 'c1', 'is_owner': False, 'ref': 'm1'}
     assert state.is_guest(turn)
     assert guest.cli_denied('whitelist', argparse.Namespace(), turn)  # 访客这一轮里连看白名单都不行
-    assert guest.GUEST_CLI_ALLOWED == {'send', 'forward', 'recall', 'task', 'messages', 'history', 'download'}
+    assert guest.GUEST_CLI_ALLOWED == {'send', 'doc', 'forward', 'recall', 'task', 'messages', 'history', 'download', 'ping'}
 
 
 # ---- 存储 ----

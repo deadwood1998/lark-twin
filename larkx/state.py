@@ -77,12 +77,15 @@ def _verify(data: dict) -> bool:
 
 
 def write_turn(kind: str, chat_id: str = '', anchor: str = '', is_owner: bool = False, ref: str = '',
-               locked: dict = None):
-    """locked: daemon 自己的配置里数字人不能用环境变量改的几项(见 config.LOCKED_KEYS), 数字人进程里的命令以这里为准。
+               locked: dict = None, dev: bool = False, watch: bool = False):
+    """dev: 交互协议给这个会话开了开发模式, 别人发起的这一轮不按访客收窄; 发消息仍只能发到本会话(send_denied 只看 is_owner)。
+    watch: 本人在线(larkx watch)时别人发起的这一轮, 只能看当前会话、通知本人。
+    locked: daemon 自己的配置里数字人不能用环境变量改的几项(见 config.LOCKED_KEYS), 数字人进程里的命令以这里为准。
     整个内容带签名(sig), read_turn 校验不过就当没有这一轮。"""
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     data = {'kind': kind, 'chat_id': str(chat_id or ''), 'anchor': anchor or '', 'is_owner': bool(is_owner),
-            'ref': str(ref or ''), 'pid': os.getpid(), 'started_at': time.time(), 'locked': locked or {}}
+            'dev': bool(dev), 'watch': bool(watch), 'ref': str(ref or ''), 'pid': os.getpid(), 'started_at': time.time(),
+            'locked': locked or {}}
     data['sig'] = _sign(data, _new_turn_key())
     tmp = TURN_PATH.with_suffix('.tmp')
     tmp.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
@@ -163,7 +166,7 @@ def is_forward(msg: dict) -> bool:
 
 def is_guest(turn) -> bool:
     """访客发起的这一轮: 别人的消息(含被接管会话)、别人安排的任务。本人发起、终端指令、维护任务都不算。"""
-    return bool(turn) and turn.get('kind') in ('message', 'task') and not turn.get('is_owner')
+    return bool(turn) and turn.get('kind') in ('message', 'task') and not turn.get('is_owner') and not turn.get('dev')
 
 
 def send_denied(target_chat: str, turn) -> str:

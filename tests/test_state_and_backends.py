@@ -206,7 +206,7 @@ def test_memory_flush_before_compaction(tmp_path, monkeypatch):
         async def context_pressure(self):
             return self.pressure
 
-        async def ask(self, prompt):
+        async def ask(self, prompt, key=None, **kw):
             self.prompts.append(prompt)
             return TurnResult('success', False, '', 0.1)
 

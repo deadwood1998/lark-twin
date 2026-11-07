@@ -271,7 +271,7 @@ def test_local_message_rule_pipeline(monkeypatch, fake_client):
     fake_client.send_message = send
     prompts = []
     class Agent:
-        async def ask(self, prompt):
+        async def ask(self, prompt, key=None, **kw):
             prompts.append(prompt)
             assert state.read_turn()['is_owner'] is True
             assert cli.cmd_send(argparse.Namespace(chat_id='target', text=['work'], root=None,

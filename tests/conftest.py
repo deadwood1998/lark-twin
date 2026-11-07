@@ -11,6 +11,7 @@ def _isolate_local_state(monkeypatch, tmp_path):
     # 本机 .env 里的配置(load_dotenv 会向上找到它)不能带进测试, 一律从代码默认值出发
     for key in [k for k in os.environ if k.startswith('LARKX_')]:
         monkeypatch.delenv(key)
+    from larkx.plugins.memory.work import sessions as session_feed
     monkeypatch.setenv('LARKX_STORAGE_URL', f'sqlite:///{tmp_path}/default.db')
     monkeypatch.setattr(state, 'STATE_DIR', tmp_path / 'state')
     monkeypatch.setattr(state, 'TURN_PATH', tmp_path / 'state' / 'turn.json')
@@ -25,6 +26,9 @@ def _isolate_local_state(monkeypatch, tmp_path):
     monkeypatch.setattr(auth, 'CREDENTIALS_PATH', tmp_path / 'credentials.json')
     monkeypatch.setattr(auth.LarkAuth.__init__, '__defaults__', (tmp_path / 'credentials.json',))
     monkeypatch.setitem(config._owner_cache, 'mtime', None)
+    # 不读本机真实的 Codex / Claude Code 会话
+    monkeypatch.setattr(session_feed, 'CODEX_SESSIONS', tmp_path / 'no-codex')
+    monkeypatch.setattr(session_feed, 'CLAUDE_PROJECTS', tmp_path / 'no-claude')
 
 
 class FakeClient:
@@ -46,6 +50,13 @@ class FakeClient:
         self.reactions = []   # add_reaction 的调用: (消息 id, 表情 key)
         self.reaction_error = None  # add_reaction 抛的异常
         self.api_responses = {}
+        self.reminds = {}     # chat_reminds 返回的免打扰状态 {chat_id: 是否提醒}
+        self.remind_error = None
+
+    def chat_reminds(self, chat_ids):
+        if self.remind_error:
+            raise self.remind_error
+        return {str(c): self.reminds[str(c)] for c in chat_ids if str(c) in self.reminds}
 
     def send_msg(self, text, chat_id, root_id=None, keep_unread=False):
         self.sent.append((chat_id, text))

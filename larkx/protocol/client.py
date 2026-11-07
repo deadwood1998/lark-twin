@@ -14,6 +14,7 @@ from .proto.ids import generate_access_key, generate_long_request_id, generate_r
 WS_STATS_INTERVAL = 600
 PUSH_SID = 6000  # improto.Command.PUSH_SID: 只推来 sid, 完整的推送包要按 sid 再拉
 BATCH_COPY = 134  # messages.PushBatchCopyMessages: 逐条转发到会话的消息不推 cmd 6, 只推这个, 别的消息要按 id 再拉
+DOC_FEED = 14004  # docs.PushDocFeedRequest: 云文档里 @本人、评论、回复的通知, 不是 IM 消息, 见 decoders.doc_feed_messages
 
 
 class PushStats:
@@ -255,6 +256,8 @@ class LarkClient:
             asyncio.run_coroutine_threadsafe(self._pull_sids(decoders.push_sids(raw), on_message), self.loop)
         elif cmd == BATCH_COPY:
             asyncio.run_coroutine_threadsafe(self._batch_copy(packet.get('payload') or b'', on_message), self.loop)
+        elif cmd == DOC_FEED:
+            asyncio.run_coroutine_threadsafe(self._doc_feed(packet.get('payload') or b'', on_message), self.loop)
         self.push_stats.packet(cmd, frame, packet)
 
     async def _pull_sids(self, sids, on_message):
@@ -267,10 +270,36 @@ class LarkClient:
             packets = (resp or {}).get('packets') or {}
             msgs = [m for p in packets.values() if int(p.get('cmd') or 0) == 6
                     for m in decoders.push_messages(p.get('payload') or b'') if m.get('from_id')]
+            docs = [p.get('payload') or b'' for p in packets.values() if int(p.get('cmd') or 0) == DOC_FEED]
         except Exception as e:
             self.push_stats.error(e, what=f'按 sid 补拉 PUSH_SID {sids} 失败, 这几条靠补收')
             return
         self.push_stats.pull(sids, packets, len(msgs))
+        for msg in msgs:
+            await self._dispatch(msg, on_message)
+        for payload in docs:
+            await self._doc_feed(payload, on_message)
+
+    async def _doc_feed(self, payload: bytes, on_message):
+        """云文档通知(cmd 14004): 解出这篇文档的通知消息, 和 IM 消息一样交给回调(去重、触发规则都在回调里)。
+        推送里没带消息时, 按 feed id 只读地拉回来(docs.PullDocFeedsByIdsRequest, 不改变文档通知的已读状态)。
+        补收只核对 IM 会话, 文档通知漏推了补不回来。"""
+        feed_id = ''
+        try:
+            logger.info(f'[云文档通知] {decoders.doc_feed_summary(payload)}')
+            feed, messages = decoders.doc_feed_push(payload)
+            if not feed:
+                return
+            feed_id = str(feed.get('id'))
+            last = str(feed.get('lastMessageId') or '')
+            if last and last not in messages:
+                resp = await asyncio.to_thread(self.api, 'docs.PullDocFeedsByIdsRequest', {'docFeedIds': [feed_id]})
+                feed = ((resp or {}).get('docFeeds') or {}).get(feed_id) or feed
+                messages = {**((resp or {}).get('docMessages') or {}), **messages}
+            msgs = decoders.doc_feed_messages(feed, messages)
+        except Exception as e:
+            self.push_stats.error(e, what=f'处理云文档通知 cmd 14004(feed {feed_id or "?"})失败, 这条通知丢了')
+            return
         for msg in msgs:
             await self._dispatch(msg, on_message)
 
@@ -670,6 +699,17 @@ class LarkClient:
         for _, chat in chats.items():
             return chat
         return None
+
+    def chat_reminds(self, chat_ids, batch: int = 50) -> dict:
+        """{chat_id: 本人是否收提醒}; False 就是开了免打扰。只读地查会话信息的 isRemind, 查不到的会话不在结果里。"""
+        ids = [str(c) for c in chat_ids]
+        out = {}
+        for i in range(0, len(ids), batch):
+            resp = self.api('chats.PullChatsByIdsRequest', {'chatIds': ids[i:i + batch]}) or {}
+            for cid, chat in (resp.get('chats') or {}).items():
+                if 'isRemind' in chat:
+                    out[str(cid)] = bool(chat['isRemind'])
+        return out
 
     def feed_chats(self, since: float, max_pages: int = 20) -> list:
         """消息列表(feed)里 since(unix 秒)之后有更新的会话 id, 新的在前。

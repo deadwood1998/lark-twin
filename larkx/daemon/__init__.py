@@ -3,26 +3,27 @@ import asyncio
 import json
 import signal
 import time
-from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from loguru import logger
 
-from .. import notify, state
+from .. import doc_comments, notify, owner_inbox, plugins, state
 from .. import whitelist as wl
 from ..agent import SessionCrashed, create_session, ensure_agent_home
 from ..agent.home import commit_agent_home
 from ..config import CREDENTIALS_PATH, DATA_DIR, load_config, locked_values, with_signature
 from ..notify import Notifier
 from ..protocol import AuthExpired, LarkAuth, LarkClient
+from ..protocol.proto.decoders import is_doc_chat
 from ..storage import ACK_REACTION, Storage
 from ..event_rules import RuleStore
 from .listener import Listener
+from .events import Event
 from .maintenance import Maintenance
 from .prompts import TAKEOVER_SUMMARY, flush_prompt
-from .triggers import (build_prompt, build_report_prompt, build_say_prompt, build_system_prompt, build_task_prompt,
-                       denied_attempt, parse_command, parse_takeover, should_handle, strip_mentions, strip_prefix,
-                       takeover_note)
+from .triggers import (FROM_TYPE_BOT, WATCH_NOTE, WATCH_OWNER_NOTE, build_prompt, build_report_prompt, build_say_prompt,
+                       build_system_prompt, build_task_prompt, denied_attempt, mentions_me, parse_command, parse_takeover,
+                       should_handle, strip_mentions, strip_prefix, takeover_note)
 
 LOG_PATH = DATA_DIR / 'logs' / 'daemon.log'
 DAEMON_STATE = state.STATE_DIR / 'daemon.json'
@@ -40,25 +41,6 @@ WS_GAP_MARGIN = 60         # 断线窗口前后各放宽多少秒: 断开前刚�
 WS_GAP_KEEP = 86400        # 断线窗口记多久: 这期间补收到的、发送时间落在窗口里的消息都不算长连接漏推
 SYSTEM_MSG_TYPE = 6        # Message.Type.SYSTEM: 入群、改群名、"大群已关闭通知"(type=1500)这类系统提示
 RECONNECT_ALERT = (3, 600)  # 10 分钟内断线 3 次就告警
-
-
-@dataclass
-class Event:
-    kind: str
-    prompt: str
-    chat_id: str = ''
-    anchor: str = ''
-    is_owner: bool = False
-    ref: str = ''
-    task_id: int = 0
-    msg: dict = None
-    body: str = ''
-    chat_name: str = ''
-    sender_name: str = ''
-    inbox_id: int = 0
-    note: str = ''
-    run_id: int = 0  # 例行任务的运行记录
-
 
 class Daemon:
     def __init__(self, auth):
@@ -80,13 +62,29 @@ class Daemon:
         self._ws_down_at = None  # 长连接这次断开的时间(重连失败不改), 重新连上后清掉
         self._ws_gaps = []       # 最近的断线窗口 [(断开时间, 重新连上的时间)]
         self._catchup_wake = asyncio.Event()  # 长连接重新连上时叫醒补收循环, 马上补收一轮
+        self.turn_lock = asyncio.Lock()  # 数字人的一轮处理和插件的后台维护(如记忆归档)不同时改文件
+        # 插件: 记忆策略(larkx/plugins/memory/)和交互协议(larkx/plugins/comms/), 默认是上游原样
+        self.memory, self.comms = plugins.load(self.cfg)
         self._ack_tasks = set()  # 后台正在加的表情回复(留着引用, 免得任务被回收)
         self._owner_stopped = False  # 本人 /stop 打断了当前这一轮
+
+    def __getattr__(self, name):
+        # 没走 __init__ 构造的(测试里常见)也能用: 插件按 cfg 现取(默认就是上游原样), 锁现建
+        if name in ('memory', 'comms'):
+            # 只补缺的那个: 已经设好的(比如测试里换成了别的协议)不能被覆盖
+            loaded = dict(zip(('memory', 'comms'), plugins.load(self.__dict__.get('cfg') or {})))
+            setattr(self, name, loaded[name])
+            return self.__dict__[name]
+        if name == 'turn_lock':
+            self.turn_lock = asyncio.Lock()
+            return self.turn_lock
+        raise AttributeError(name)
 
     def _banner(self):
         t = self.cfg.get('triggers') or {}
         print('─' * 56, flush=True)
         print(f'larkx daemon  region={self.auth.region.name}  user={self.auth.user_id}  agent={self.cfg["agent_backend"]}', flush=True)
+        print(f'  插件: {plugins.describe(self.cfg)}', flush=True)
         print(f'  数字人目录: {self.home}', flush=True)
         print(f'  触发前缀: {t.get("prefix") or "(全部消息)"}  允许自己触发: {self.cfg.get("allow_self")}', flush=True)
         print(f'  群里别人需 @我: {bool(t.get("group_at_only"))}  只有本人能唤起: {bool(t.get("owner_only"))}', flush=True)
@@ -133,20 +131,43 @@ class Daemon:
     async def on_message(self, msg: dict, chat_name: str = '', sender_name: str = ''):
         is_owner = str(msg.get('from_id')) == str(self.auth.user_id)
         chat_id = str(msg['chat_id'])
+        if is_doc_chat(chat_id) and not msg.get('anchor'):
+            # 拿不到评论 ID 的文档通知(正文里的 @、一次推来几条里较早的那些)回复不了, 只入库
+            return
         tk = None if is_owner else self.storage.takeover_get(chat_id, time.time())
         # 白名单每条都现查: 命令行、网页改了立即生效, 不用重启
         whitelist = () if is_owner else self.storage.whitelist_ids()
         handle = bool(tk) or should_handle(msg, self.cfg, self.auth.user_id, whitelist=whitelist)
         denied = not handle and not is_owner and denied_attempt(msg, self.cfg, self.auth.user_id, whitelist)
+        # 旁听(交互协议决定, 上游没有): 别人在这个会话发的消息不用 @、不用前缀也交给数字人, 它自己判断要不要回;
+        # 旁听的会话里不回"没有权限"。本人自己的消息(包括数字人以本人身份发的)不旁听, 不会自己触发自己
+        profile = None if is_owner or tk or handle else self.comms.listen_profile(self, msg)
+        listen = profile is not None
+        if listen:
+            denied = False
         age = time.time() - float(msg.get('create_time') or time.time())
         if age > self.cfg['inbox_max_age']:
             # 太久远的消息(多是补收到的)只入库, 不做任何对外动作: 不交给数字人, 不回"没有权限", 不接管, 也不执行本人的指令
-            if handle or denied:
+            if handle or denied or listen:
                 logger.info(f'跳过 {age / 60:.0f} 分钟前的消息 {msg.get("msg_id")}(超过 LARKX_INBOX_MAX_AGE)')
+            return
+        if not is_owner and not handle and owner_inbox.watching() and not is_doc_chat(chat_id) and \
+                msg.get('from_type') != FROM_TYPE_BOT and msg.get('msg_type') != SYSTEM_MSG_TYPE and \
+                (denied or msg.get('chat_type') == 1 or mentions_me(msg, self.auth.user_id) or
+                 self.storage.replies_to_owner(msg, self.auth.user_id)):
+            # 本人在线(larkx watch): 别人私聊本人、@ 本人、回本人消息的、没权限想唤起的, 平时数字人不处理或只回"没有权限";
+            # 在线时都交给数字人看一眼, 由它判断要不要写进本人收件箱(larkx ping), 不回复。旁听的会话里也走这里,
+            # 不受旁听的条数上限和机器人过滤影响, 找本人的不会漏
+            await self._enqueue_message(msg, (msg.get('content') or '').strip(), chat_name, sender_name, False, judge=True)
             return
         if denied:
             # 没权限的人想唤起: 马上回一句"没有权限", 不交给数字人
             await self._deny(msg, chat_name, sender_name)
+            return
+        if listen:
+            if await self.comms.listen_ok(self, msg, profile, chat_name):
+                await self._enqueue_message(msg, (msg.get('content') or '').strip(), chat_name, sender_name, False,
+                                            listen=True)
             return
         if not handle:
             return
@@ -174,6 +195,9 @@ class Daemon:
             if not rest:
                 await self._reply(chat_id, '✅ 已开启新会话(长期记忆保留)', root_id)
                 return
+        elif cmd in ('takeover', 'release') and is_doc_chat(chat_id):
+            self.notifier.send(f'云文档「{chat_name or chat_id}」的评论不能接管, 接管只对 IM 会话有效')
+            return
         elif cmd == 'takeover':
             if chat_id == self.notifier.owner_chat():
                 self.notifier.send('要接管哪个会话, 就在那个会话里发 /ai /takeover [时长] [目标]; '
@@ -234,11 +258,16 @@ class Daemon:
             if state.deny_cooling(chat_id, sender_id, self.cfg.get('deny_reply_cooldown', 0)):
                 logger.info(f'[没权限] {who} 在「{where}」想唤起数字人, 冷却时间内已经回过, 这次不回')
                 return
-            # 引用回复他的那条: 话题群、普通群的话题里回进那个话题(rootId 是话题的根), 别的地方留在主会话
-            sent = await asyncio.to_thread(self.client.send_message, {'kind': 'text', 'text': text}, chat_id,
-                                           root_id=msg.get('anchor') or msg_id, parent_id=msg_id)
+            error = '发送失败'
+            if is_doc_chat(chat_id):
+                # 云文档里回在他那条评论下面
+                sent, error = await self._doc_reply(chat_id, msg.get('anchor'), text)
+            else:
+                # 引用回复他的那条: 话题群、普通群的话题里回进那个话题(rootId 是话题的根), 别的地方留在主会话
+                sent = await asyncio.to_thread(self.client.send_message, {'kind': 'text', 'text': text}, chat_id,
+                                               root_id=msg.get('anchor') or msg_id, parent_id=msg_id)
             self.storage.log_action(actor='daemon', action='deny_reply', chat_id=chat_id, msg_id=str(sent or ''),
-                                    content=text, ok=1 if sent else 0, error='' if sent else '发送失败',
+                                    content=text, ok=1 if sent else 0, error='' if sent else error,
                                     turn_kind='message', turn_ref=msg_id)
             if sent:
                 logger.info(f'[没权限] {who} 在「{where}」想唤起数字人, 已回复: {text}')
@@ -247,7 +276,8 @@ class Daemon:
         except Exception as e:
             logger.exception(f'没权限回复出错: {e!r}')
 
-    async def _enqueue_message(self, msg, body, chat_name, sender_name, is_owner, note='', ack=False):
+    async def _enqueue_message(self, msg, body, chat_name, sender_name, is_owner, note='', ack=False, listen=False,
+                               judge=False):
         if not body:
             return
         if msg.get('msg_id') and self.storage.inbox_seen(msg['msg_id']):
@@ -259,8 +289,9 @@ class Daemon:
         slim = {k: msg.get(k) for k in MSG_FIELDS}
         inbox_id = self.storage.inbox_add(slim['msg_id'] or '', str(msg['chat_id']),
                                           {'msg': slim, 'body': body, 'chat_name': chat_name, 'sender_name': sender_name,
-                                           'is_owner': is_owner, 'note': note})
-        await self.inbox.put(self._message_event(slim, body, chat_name, sender_name, is_owner, inbox_id, note=note))
+                                           'is_owner': is_owner, 'note': note, 'listen': listen, 'judge': judge})
+        await self.inbox.put(self._message_event(slim, body, chat_name, sender_name, is_owner, inbox_id, note=note,
+                                                 listen=listen, judge=judge))
 
     def _ack(self, msg, is_owner):
         """触发时先回一个表情: 网页"设置"页打开了, 并且在范围里(只对本人自己发的 /ai, 或所有触发数字人的消息), 就以本人身份
@@ -275,7 +306,11 @@ class Daemon:
         那一条马上已读, 还可能把本人在这个会话的已读位置推到最新, 之后别人新发的也成了已读(三次里出现过一次)。
         """
         msg_id = str(msg.get('msg_id') or '')
-        if not msg_id:
+        if not is_owner and owner_inbox.watching():
+            # 本人在线: 别人的消息数字人不回, 表情也不加(加了对方会以为在处理, 那条也会被标成已读)
+            return
+        if not msg_id or is_doc_chat(msg.get('chat_id')):
+            # 云文档通知不是 IM 消息, 加不了表情
             return
         try:
             conf = self.storage.ack_reaction()
@@ -317,10 +352,10 @@ class Daemon:
             await self.inbox.put(Event('report', prompt, chat_id=owner_chat, ref=f'takeover-end:{tk.chat_id}'))
 
     @staticmethod
-    def _message_event(msg, body, chat_name, sender_name, is_owner, inbox_id, note=''):
+    def _message_event(msg, body, chat_name, sender_name, is_owner, inbox_id, note='', listen=False, judge=False):
         return Event('message', '', chat_id=str(msg['chat_id']), anchor=msg.get('anchor') or '', is_owner=is_owner,
                      ref=str(msg.get('msg_id') or ''), msg=msg, body=body, chat_name=chat_name, sender_name=sender_name,
-                     inbox_id=inbox_id, note=note)
+                     inbox_id=inbox_id, note=note, listen=listen, judge=judge)
 
     def _restore_inbox(self):
         restored = expired = 0
@@ -337,7 +372,8 @@ class Daemon:
                 continue
             note = '; '.join(n for n in (p.get('note'), RESTART_NOTE) if n)
             self.inbox.put_nowait(self._message_event(p['msg'], p['body'], p.get('chat_name', ''), p.get('sender_name', ''),
-                                                      p.get('is_owner', False), row.id, note=note))
+                                                      p.get('is_owner', False), row.id, note=note,
+                                                      listen=p.get('listen', False), judge=p.get('judge', False)))
             restored += 1
         if restored or expired:
             logger.info(f'收件箱: {restored} 条重启前没处理完的消息接着处理, {expired} 条太久远已放弃')
@@ -555,9 +591,21 @@ class Daemon:
 
     async def _reply(self, chat_id, text, root_id=None):
         text = with_signature(text, self.cfg)
+        if is_doc_chat(chat_id):
+            sent, error = await self._doc_reply(chat_id, root_id, text)
+            if not sent:
+                logger.error(f'控制回执回复评论失败 [{chat_id}]: {text}: {error}')
+            return
         msg_id = await asyncio.to_thread(self.client.send_msg, text, chat_id, root_id, self.cfg.get('keep_unread', False))
         if not msg_id:
             logger.error(f'控制回执发送失败 [{chat_id}]: {text}')
+
+    async def _doc_reply(self, chat_id, comment_id, text) -> tuple:
+        """daemon 自己在云文档评论下回一句(控制回执、没权限回复)。返回 (回复的 id, 失败原因), 成功时原因为空。"""
+        try:
+            return await asyncio.to_thread(doc_comments.reply, self.cfg, self.storage, chat_id, comment_id, text), ''
+        except doc_comments.DocError as e:
+            return '', str(e)
 
     # ---- 定时任务与每日回顾 ----
 
@@ -591,9 +639,14 @@ class Daemon:
                     await self.inbox.put(ev)
                 await self._finish_takeovers()
                 await self.maintenance.tick()
+                await self.memory.tick(self)
             except Exception as e:
                 logger.exception(f'调度异常: {e!r}')
             await asyncio.sleep(SCHEDULER_INTERVAL)
+
+    async def _commit(self, message: str):
+        """把数字人目录的变化提交进它自己的 git 仓库(插件收尾时也用)。"""
+        await asyncio.to_thread(commit_agent_home, self.home, message)
 
     def _finish_task(self, ev: Event, result):
         task = self.storage.get_task(ev.task_id)
@@ -611,9 +664,11 @@ class Daemon:
     # ---- 交给数字人 ----
 
     async def _run_turn(self, ev: Event, prompt: str):
-        state.write_turn(ev.kind, ev.chat_id, ev.anchor, ev.is_owner, ev.ref, locked=locked_values(self.cfg))
+        state.write_turn(ev.kind, ev.chat_id, ev.anchor, ev.is_owner, ev.ref, locked=locked_values(self.cfg),
+                         dev=ev.dev, watch=getattr(ev, 'watch', False))
         try:
-            return await self.session.ask(prompt)
+            # 记忆策略决定这一轮接着哪个会话、新会话怎么接上前情(上游: 不带参数)
+            return await self.session.ask(prompt, **self.memory.ask_options(ev))
         finally:
             state.clear_turn()
 
@@ -624,12 +679,36 @@ class Daemon:
             return  # paused/cancelled/duplicate queue item
         note, result = ev.note, None
         self._owner_stopped = False
+        extra = watch_extra = ''
+        if ev.kind == 'message':
+            # 交互协议按处理这一刻的会话配置算: 排队期间关了旁听就不再处理, 关了开发模式就按访客处理(上游: 什么都不改)
+            ctx = self.comms.message_context(self, ev)
+            if ctx.get('skip'):
+                if ev.inbox_id:
+                    self.storage.inbox_set(ev.inbox_id, 'done')
+                return
+            ev.dev = bool(ctx.get('dev'))
+            extra, watch_extra = ctx.get('note') or '', ctx.get('watch_note') or ''
+        # 本人在线(larkx watch): 别人发起的消息和任务只判断要不要本人处理、写收件箱, 不回复也不执行(代码也拦着)
+        ev.watch = ev.kind in ('message', 'task') and not ev.is_owner and owner_inbox.watching()
+        if ev.judge and not ev.watch:
+            # 排队期间本人退出了 watch: 这条平时本来就不交给数字人, 不处理(也不补回"没有权限")
+            logger.info(f'本人已不在线, 跳过排队中只供判断的 {ev.ref}')
+            if ev.inbox_id:
+                self.storage.inbox_set(ev.inbox_id, 'done')
+            return
+        if ev.watch:
+            ev.dev = False
+            owner = self._watch_reason(ev) if ev.kind == 'message' else ''
+            extra = '; '.join(n for n in (watch_extra, WATCH_NOTE, WATCH_OWNER_NOTE.format(reason=owner) if owner else '')
+                              if n)
         # 事件任务和例行任务里给本人的汇报(简报)崩溃后不当轮重跑: 汇报可能已经发出去了, 由 maintenance 查过再决定要不要兜底。
         # 接管结束的总结没有运行记录和兜底, 照常重试一次
         for attempt in ((1,) if is_event or (ev.run_id and ev.kind == 'report') else (1, 2)):
             prompt = ev.prompt
             if ev.kind == 'message':
-                prompt = build_prompt(ev.msg, ev.body, ev.chat_name, ev.sender_name, is_owner=ev.is_owner, note=note)
+                prompt = build_prompt(ev.msg, ev.body, ev.chat_name, ev.sender_name, is_owner=ev.is_owner,
+                                      note='; '.join(n for n in (extra, note) if n), dev=ev.dev, comms=self.comms)
             try:
                 if ev.run_id:
                     self.maintenance.started(ev.run_id)
@@ -658,6 +737,20 @@ class Daemon:
         if ev.task_id and not is_event:
             self._finish_task(ev, result)
         await asyncio.to_thread(commit_agent_home, self.home, f'{ev.kind} {ev.ref}'.strip())
+        return result
+
+    def _watch_reason(self, ev: Event) -> str:
+        """本人在线时, 这条消息为什么算和本人有关(要写收件箱); 无关返回空。"""
+        msg, me = ev.msg or {}, self.auth.user_id
+        if mentions_me(msg, me):
+            return '@ 了本人'
+        if msg.get('chat_type') == 1:
+            return '私聊本人'
+        if self.storage.replies_to_owner(msg, me):
+            return '回复了本人的消息, 或在本人发起、回过话的话题里'
+        if not ev.listen and not ev.judge:
+            return '在叫本人的数字人(白名单里的人用触发前缀, 或接管中的会话)'
+        return ''
 
     def _report(self, ev: Event, result):
         """把这一轮里值得本人知道的异常发给本人。"""
@@ -686,14 +779,22 @@ class Daemon:
         except SessionCrashed as e:
             logger.error(f'整理记忆时 agent 会话中断: {e}')
 
+    async def _process(self, ev: Event):
+        result = None
+        try:
+            if not self.memory.skip_event(ev):
+                async with self.turn_lock:
+                    result = await self._handle(ev)
+                await self._maybe_flush_memory()
+        except Exception as e:
+            logger.exception(f'处理 {ev.kind} {ev.ref} 异常: {e!r}')
+        finally:
+            # 出异常也要告诉记忆策略这一轮结束了(如消化轮记上这一段, 不然那一窗永远收不了尾)
+            await self.memory.after_event(self, ev, result)
+
     async def _consume(self):
         while True:
-            ev = await self.inbox.get()
-            try:
-                await self._handle(ev)
-                await self._maybe_flush_memory()
-            except Exception as e:
-                logger.exception(f'处理 {ev.kind} {ev.ref} 异常: {e!r}')
+            await self._process(await self.inbox.get())
 
 
 async def _run_until_signal(coro):

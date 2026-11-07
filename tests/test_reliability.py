@@ -89,7 +89,7 @@ class FakeSession:
     def __init__(self):
         self.prompts, self.events = [], []
 
-    async def ask(self, prompt):
+    async def ask(self, prompt, key=None, **kw):
         from larkx.agent import TurnResult
         self.prompts.append(prompt)
         return TurnResult('success', False, '', 0.1)
@@ -105,6 +105,7 @@ def _daemon(tmp_path, fake_client, monkeypatch):
     obj.cfg = json.loads(json.dumps(DEFAULTS))
     obj.cfg['triggers']['prefix'] = '/ai'
     obj.cfg['triggers']['owner_only'] = False      # 默认开; 这里测别人发的 /ai 能进收件箱
+    obj.cfg['agent_home'] = str(tmp_path)   # 插件按它找数字人目录, 不能碰本机真实的 ~/.larkx
     obj.storage = Storage(f'sqlite:///{tmp_path}/d.db')
     from larkx.event_rules import RuleStore
     obj.rule_store = RuleStore(obj.storage)
@@ -347,6 +348,31 @@ def test_mentions_structured_at_only(tmp_path):
                     sender_name='李四')
     assert [r['msg_id'] for r in st.mentions('100', '', t - 3600)] == ['e']
     assert [r['msg_id'] for r in st.mentions('100', '', t - 3600, limit=1)] == ['e']
+
+
+def test_mentions_include_replies_to_owner(tmp_path):
+    """回复本人的消息、本人发起或回过话的话题里的消息, 和 @ 本人一样算找本人; 数字人以本人身份发的不算本人的话。"""
+    st = Storage(f'sqlite:///{tmp_path}/m.db')
+    t = int(time.time())
+
+    def save(mid, sender, content, dt, root='', parent='', direction='in'):
+        st.save_message({'msg_id': mid, 'chat_id': 'g1', 'chat_type': 2, 'from_id': sender, 'content': content,
+                         'create_time': t - dt, 'anchor': root, 'root_id': root, 'parent_id': parent},
+                        sender_name='耿宇贺' if sender == '100' else '李四', direction=direction)
+    save('o1', '100', '@李四 同步一下进度', 100, direction='out')                    # 本人发起的话题
+    save('r1', '300', '收到, 在看', 90, root='o1', parent='o1')                       # 直接回本人
+    save('r2', '400', '我们也在 review', 80, root='o1', parent='o1')
+    save('o2', '100', '你真合了吗', 70, root='o1', parent='r1', direction='out')
+    save('r3', '300', '说清楚一点: 还没推', 60, root='o1', parent='o2')               # 回本人在话题里的回复
+    save('x1', '300', '另一个话题', 50)
+    save('a1', '100', '数字人代回', 40, root='x1', parent='x1', direction='out')       # 数字人以本人身份发的
+    st.log_action(actor='agent', action='send', chat_id='g1', msg_id='a1')
+    save('x2', '300', '继续另一个话题', 30, root='x1', parent='a1')                  # 不算找本人
+    rows = st.mentions('100', st.owner_name('100'), t - 3600)
+    assert [(r['msg_id'], r['kind']) for r in rows] == [('r1', 'reply'), ('r2', 'reply'), ('r3', 'reply')]
+    assert st.replies_to_owner({'chat_id': 'g1', 'root_id': 'o1', 'parent_id': 'r2'}, '100')
+    assert not st.replies_to_owner({'chat_id': 'g1', 'root_id': 'x1', 'parent_id': 'a1'}, '100')
+    assert not st.replies_to_owner({'chat_id': 'g1'}, '100')
 
 
 def test_listener_leaves_messages_unread_by_default(tmp_path, fake_client):

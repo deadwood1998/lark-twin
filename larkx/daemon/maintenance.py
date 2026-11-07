@@ -60,7 +60,11 @@ class Maintenance:
 
     async def tick(self, now: datetime = None):
         now = now or datetime.now()
+        # 记忆策略接管的例行任务(比如每小时消化代替每日回顾)不按时跑
+        replaced = self.d.memory.replaced_jobs()
         for job in jobs.JOBS:
+            if job.name in replaced:
+                continue
             if job.once:
                 if job.when(self.d.cfg) is None:
                     continue
