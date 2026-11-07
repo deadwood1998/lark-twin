@@ -73,6 +73,7 @@ def cmd_memory(args):
         'dir': str(root),
         'overview_chars': layout.overview_size(home), 'overview_budget': layout.OVERVIEW_BUDGET,
         'counts': {d: len(list((root / d).glob('*.md'))) for d in layout.DIMS},
+        'self_doing': layout.self_doing(home),
         'archive_weeks': sorted(p.name for p in (root / 'archive').glob('*-W*')) if (root / 'archive').exists() else [],
         'digest_interval': cfg.get('memory_digest_interval'),
         'digested_until': datetime.fromtimestamp(digest_until).strftime('%Y-%m-%d %H:%M') if digest_until else None,
@@ -84,7 +85,7 @@ def cmd_memory(args):
         return 0
     c = info['counts']
     print(f"工作记忆 {info['dir']}")
-    print(f"  总览 {info['overview_chars']}/{info['overview_budget']} 字; 项目 {c['projects']} 个, 任务 {c['tasks']} 个, 人 {c['people']} 个;"
+    print(f"  总览 {info['overview_chars']}/{info['overview_budget']} 字; 本人在做 {info['self_doing']} 项, 项目 {c['projects']} 个, 任务 {c['tasks']} 个, 人 {c['people']} 个;"
           f" 归档 {len(info['archive_weeks'])} 周")
     every = info['digest_interval']
     print(f"  消化: {'每 %s 秒一次' % every if every else '已关闭'}, 已消化到 {info['digested_until'] or '(还没跑过)'}")

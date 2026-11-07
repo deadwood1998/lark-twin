@@ -102,7 +102,8 @@ def test_layout_rules_and_pointer(tmp_path):
     assert all((root / d).is_dir() for d in memory.DIMS)
     (root / 'OVERVIEW.md').write_text('# 我改过的总览\n', encoding='utf-8')
     memory.ensure_layout(tmp_path)
-    assert (root / 'OVERVIEW.md').read_text(encoding='utf-8') == '# 我改过的总览\n'   # 总览不覆盖
+    # 总览不覆盖, 只补上缺的"本人在做"小节
+    assert (root / 'OVERVIEW.md').read_text(encoding='utf-8') == '# 我改过的总览\n## 本人在做\n'
 
 
 def test_short_term_pruned_after_24h(tmp_path):
@@ -488,3 +489,45 @@ def test_digest_includes_own_coding_sessions(tmp_path, monkeypatch, fake_client)
     st = obj.memory.load_state()
     assert st['session_offsets'] == {'/f.jsonl': 123} and 'digest_pending' not in st
     assert not (tmp_path / 'state' / 'digest_sessions.md').exists()
+
+
+# ---- 本人的工作(me.md) ----
+
+def test_self_file_and_overview_section(tmp_path):
+    root = memory.ensure_layout(tmp_path)
+    me = (root / 'me.md').read_text(encoding='utf-8')
+    assert all(f'## {h}' in me for h in ('正在做', '工作环境', '近况', '归档'))
+    assert (root / 'OVERVIEW.md').read_text(encoding='utf-8').index('## 本人在做') < \
+        (root / 'OVERVIEW.md').read_text(encoding='utf-8').index('## 进行中的项目')
+    assert 'me.md' in (root / 'RULES.md').read_text(encoding='utf-8')
+    # 本人改过的 me.md 不被模板覆盖
+    write(root, 'me.md', '# 本人\n类型：本人\n\n## 正在做\n- 重构 — group/repo feat/x — 联调中\n- 评审方案 — 等对方\n')
+    memory.ensure_layout(tmp_path)
+    assert memory.self_doing(tmp_path) == 2
+
+
+def test_old_overview_gets_self_section(tmp_path):
+    root = memory.work_dir(tmp_path)
+    write(root, 'OVERVIEW.md', '# 工作记忆总览\n\n## 进行中的项目\n- a\n\n## 待跟进\n- b\n')
+    memory.ensure_layout(tmp_path)
+    text = (root / 'OVERVIEW.md').read_text(encoding='utf-8')
+    assert text.count('## 本人在做') == 1 and text.index('## 本人在做') < text.index('## 进行中的项目')
+    assert '- a' in text and '- b' in text
+    memory.ensure_layout(tmp_path)
+    assert (root / 'OVERVIEW.md').read_text(encoding='utf-8').count('## 本人在做') == 1
+
+
+def test_self_file_items_archived_but_file_kept(tmp_path):
+    root = memory.ensure_layout(tmp_path)
+    write(root, 'me.md', '# 本人\n类型：本人\n最后更新：2026-09-01\n\n## 正在做\n- 重构 — tasks/重构.md\n\n'
+                         '## 近况\n- 2026-10-20 10:00 在 feat/x 提交了重试逻辑\n- 2026-11-04 09:00 联调通过\n\n## 归档\n')
+    write(root, 'tasks/重构.md', '# 重构\n类型：任务\n状态：已完成\n完成于：2026-11-01\n')
+    write(root, 'OVERVIEW.md', '# 总览\n\n## 本人在做\n- 重构 — 见 [tasks/重构](tasks/重构.md)\n- 评审方案\n\n## 待跟进\n')
+    result = memory.maintain(tmp_path, now=NOW)
+    assert ('me.md', 1, 'archive/2026-W43/me.md') in result['items']
+    assert 'me.md' not in {old for old, _, _ in result['files']}          # 不整件归档
+    me = (root / 'me.md').read_text(encoding='utf-8')
+    assert '联调通过' in me and '提交了重试逻辑' not in me and 'archive/2026-W43/me.md' in me
+    assert 'archive/2026-W44/tasks/重构.md' in me                            # 引用改成归档路径
+    overview = (root / 'OVERVIEW.md').read_text(encoding='utf-8')
+    assert 'tasks/重构' not in overview and '- 评审方案' in overview          # 做完归档的那一行去掉
