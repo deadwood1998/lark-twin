@@ -195,7 +195,7 @@ larkx work-memory feed --since 2h       # 看某段时间会被消化的增量�
 larkx work-memory archive --dry-run     # 预演归档规则；去掉 --dry-run 立即执行
 ```
 
-设计细节见 [larkx/plugins/memory/work/README.md](larkx/plugins/memory/work/README.md)。
+设计思路见 [docs/memory/work-memory.md](docs/memory/work-memory.md)。
 
 ## 配套 skill
 
